@@ -1,6 +1,7 @@
 payload_sources = [
   'process.vala',
   'process-glue.c',
+  'base-agent-session.vala',
   'script-engine.vala',
   'fork-monitor.vala',
   'spawn-monitor.vala',
