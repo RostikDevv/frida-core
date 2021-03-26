@@ -336,7 +336,8 @@ namespace Frida.Gadget {
 	private enum State {
 		CREATED,
 		STARTED,
-		STOPPED
+		STOPPED,
+		DETACHED
 	}
 
 	private bool loaded = false;
@@ -445,10 +446,15 @@ namespace Frida.Gadget {
 			source.attach (Environment.get_main_context ());
 		}
 
+		State final_state;
 		mutex.lock ();
-		while (state != State.STOPPED)
+		while (state < State.STOPPED)
 			cond.wait (mutex);
+		final_state = state;
 		mutex.unlock ();
+
+		if (final_state == DETACHED)
+			return;
 
 		if (config.teardown == TeardownRequirement.FULL) {
 			config = null;
@@ -572,21 +578,28 @@ namespace Frida.Gadget {
 	}
 
 	private async void stop () {
-		if (controller != null) {
-			if (config.teardown == TeardownRequirement.MINIMAL) {
-				yield controller.prepare_for_termination (TerminationReason.EXIT);
-			} else {
-				yield controller.stop ();
-				controller = null;
+		State pending_state = STOPPED;
 
-				exceptor = null;
+		if (controller != null) {
+			if (controller.is_eternal) {
+				pending_state = DETACHED;
+			} else {
+				if (config.teardown == TeardownRequirement.MINIMAL) {
+					yield controller.prepare_for_termination (TerminationReason.EXIT);
+				} else {
+					yield controller.stop ();
+					controller = null;
+
+					exceptor = null;
+				}
 			}
 		}
 
-		worker_ignore_scope = null;
+		if (pending_state == STOPPED)
+			worker_ignore_scope = null;
 
 		mutex.lock ();
-		state = State.STOPPED;
+		state = pending_state;
 		cond.signal ();
 		mutex.unlock ();
 	}
@@ -682,12 +695,20 @@ namespace Frida.Gadget {
 	}
 
 	private interface Controller : Object {
+		public abstract bool is_eternal {
+			get;
+		}
+
 		public abstract async void start () throws Error;
 		public abstract async void prepare_for_termination (TerminationReason reason);
 		public abstract async void stop ();
 	}
 
 	private abstract class BaseController : Object, Controller, ProcessInvader {
+		public abstract bool is_eternal {
+			get;
+		}
+
 		public Config config {
 			get;
 			construct;
@@ -766,6 +787,12 @@ namespace Frida.Gadget {
 	}
 
 	private class ScriptRunner : BaseController {
+		public override bool is_eternal {
+			get {
+				return false;
+			}
+		}
+
 		private ScriptEngine engine;
 		private Script script;
 
@@ -818,6 +845,12 @@ namespace Frida.Gadget {
 	}
 
 	private class ScriptDirectoryRunner : BaseController {
+		public override bool is_eternal {
+			get {
+				return false;
+			}
+		}
+
 		public string directory_path {
 			get;
 			construct;
@@ -1248,6 +1281,13 @@ namespace Frida.Gadget {
 	}
 
 	private class Server : BaseController {
+		public override bool is_eternal {
+			get {
+				return _is_eternal;
+			}
+		}
+		private bool _is_eternal = false;
+
 		public SocketAddress listen_address {
 			get;
 			set;
@@ -1384,6 +1424,7 @@ namespace Frida.Gadget {
 
 		private void on_script_eternalized (Gum.Script script) {
 			eternalized_scripts.add (script);
+			_is_eternal = true;
 		}
 
 		private class Client : Object, HostSession {
