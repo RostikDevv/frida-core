@@ -1,7 +1,4 @@
 namespace Frida.Gadget {
-	private const string DEFAULT_LISTEN_ADDRESS = "127.0.0.1";
-	private const uint16 DEFAULT_LISTEN_PORT = 27042;
-
 	private class Config : Object, Json.Serializable {
 		public Object interaction {
 			get;
@@ -49,6 +46,9 @@ namespace Frida.Gadget {
 							break;
 						case "listen":
 							t = typeof (ListenInteraction);
+							break;
+						case "connect":
+							t = typeof (ConnectInteraction);
 							break;
 					}
 
@@ -246,23 +246,28 @@ namespace Frida.Gadget {
 		}
 	}
 
-	private class ListenInteraction : Object {
+	private class ListenInteraction : SocketInteraction {
+		public PortConflictBehavior on_port_conflict {
+			get;
+			set;
+			default = PortConflictBehavior.FAIL;
+		}
+	}
+
+	private class ConnectInteraction : SocketInteraction {
+	}
+
+	private abstract class SocketInteraction : Object {
 		public string address {
 			get;
 			set;
-			default = DEFAULT_LISTEN_ADDRESS;
+			default = "127.0.0.1";
 		}
 
 		public uint port {
 			get;
 			set;
-			default = DEFAULT_LISTEN_PORT;
-		}
-
-		public PortConflictBehavior on_port_conflict {
-			get;
-			set;
-			default = PortConflictBehavior.FAIL;
+			default = 27042;
 		}
 
 		public LoadBehavior on_load {
@@ -271,15 +276,35 @@ namespace Frida.Gadget {
 			default = LoadBehavior.WAIT;
 		}
 
-		public enum PortConflictBehavior {
-			FAIL,
-			PICK_NEXT
-		}
+		public SocketAddress parse_socket_address () throws Error {
+#if !WINDOWS
+			if (address.has_prefix ("unix:")) {
+				string path = address.substring (5);
 
-		public enum LoadBehavior {
-			RESUME,
-			WAIT
+				UnixSocketAddressType type = UnixSocketAddress.abstract_names_supported ()
+					? UnixSocketAddressType.ABSTRACT
+					: UnixSocketAddressType.PATH;
+
+				return new UnixSocketAddress.with_type (path, -1, type);
+			}
+#endif
+
+			var inet_address = new InetSocketAddress.from_string (address, port);
+			if (inet_address == null)
+				throw new Error.INVALID_ARGUMENT ("Invalid address");
+
+			return inet_address;
 		}
+	}
+
+	private enum LoadBehavior {
+		RESUME,
+		WAIT
+	}
+
+	private enum PortConflictBehavior {
+		FAIL,
+		PICK_NEXT
 	}
 
 	private class Location : Object {
@@ -288,11 +313,23 @@ namespace Frida.Gadget {
 			construct;
 		}
 
-		public string bundle_id {
+		public string? bundle_id {
 			get {
-				if (cached_bundle_id == null)
+				if (!did_fetch_bundle_id) {
 					cached_bundle_id = Environment.detect_bundle_id ();
+					did_fetch_bundle_id = true;
+				}
 				return cached_bundle_id;
+			}
+		}
+
+		public string? bundle_name {
+			get {
+				if (!did_fetch_bundle_name) {
+					cached_bundle_name = Environment.detect_bundle_name ();
+					did_fetch_bundle_name = true;
+				}
+				return cached_bundle_name;
 			}
 		}
 
@@ -306,7 +343,11 @@ namespace Frida.Gadget {
 			construct;
 		}
 
+		private bool did_fetch_bundle_id = false;
 		private string? cached_bundle_id = null;
+
+		private bool did_fetch_bundle_name = false;
+		private string? cached_bundle_name = null;
 
 		public Location (string executable_name, string? path, Gum.MemoryRange range) {
 			Object (
@@ -324,7 +365,11 @@ namespace Frida.Gadget {
 					FileUtils.get_contents ("/proc/self/cmdline", out cmdline);
 					if (cmdline != "zygote" && cmdline != "zygote64") {
 						executable_name = cmdline;
+
 						cached_bundle_id = cmdline.split (":", 2)[0];
+						cached_bundle_name = cached_bundle_id;
+						did_fetch_bundle_id = true;
+						did_fetch_bundle_name = true;
 					}
 				} catch (FileError e) {
 				}
@@ -383,8 +428,8 @@ namespace Frida.Gadget {
 
 		wait_for_resume_needed = true;
 
-		var listen_interaction = config.interaction as ListenInteraction;
-		if (listen_interaction != null && listen_interaction.on_load == ListenInteraction.LoadBehavior.RESUME) {
+		var socket_interaction = config.interaction as SocketInteraction;
+		if (socket_interaction != null && socket_interaction.on_load == LoadBehavior.RESUME) {
 			wait_for_resume_needed = false;
 		}
 
@@ -556,6 +601,13 @@ namespace Frida.Gadget {
 					assert_not_reached ();
 #endif
 				}
+			} else if (interaction is ConnectInteraction) {
+				var client = new SaucerClient (config, location);
+				yield client.start ();
+				ctrl = client;
+
+				if (request != null)
+					request.set_value (0);
 			} else {
 				resume ();
 
@@ -1293,6 +1345,11 @@ namespace Frida.Gadget {
 			set;
 		}
 
+		public PortConflictBehavior on_port_conflict {
+			get;
+			construct;
+		}
+
 		private SocketService server = new SocketService ();
 		private string guid = DBus.generate_guid ();
 		private Gee.HashMap<DBusConnection, Client> clients = new Gee.HashMap<DBusConnection, Client> ();
@@ -1303,9 +1360,9 @@ namespace Frida.Gadget {
 
 		public Server (Config config, Location location) throws Error {
 			Object (
+				listen_address: ((SocketInteraction) config.interaction).parse_socket_address (),
 				config: config,
-				location: location,
-				listen_address: parse_listen_address (config)
+				location: location
 			);
 		}
 
@@ -1317,7 +1374,6 @@ namespace Frida.Gadget {
 			SocketAddress? effective_address = null;
 			InetSocketAddress? inet_address = listen_address as InetSocketAddress;
 			if (inet_address != null) {
-				var on_port_conflict = ((ListenInteraction) config.interaction).on_port_conflict;
 				uint16 start_port = inet_address.get_port ();
 				uint16 candidate_port = start_port;
 				do {
@@ -1614,30 +1670,6 @@ namespace Frida.Gadget {
 			}
 		}
 
-		private static SocketAddress parse_listen_address (Config config) throws Error {
-			var interaction = config.interaction as ListenInteraction;
-
-			unowned string raw_address = interaction.address;
-
-#if !WINDOWS
-			if (raw_address.has_prefix ("unix:")) {
-				string path = raw_address.substring (5);
-
-				UnixSocketAddressType type = UnixSocketAddress.abstract_names_supported ()
-					? UnixSocketAddressType.ABSTRACT
-					: UnixSocketAddressType.PATH;
-
-				return new UnixSocketAddress.with_type (path, -1, type);
-			}
-#endif
-
-			var address = new InetSocketAddress.from_string (raw_address, interaction.port);
-			if (address == null)
-				throw new Error.INVALID_ARGUMENT ("Invalid listen address");
-
-			return address;
-		}
-
 		[NoReturn]
 		private static void throw_listen_error (GLib.Error e) throws Error {
 			if (e is IOError.ADDRESS_IN_USE)
@@ -1647,6 +1679,175 @@ namespace Frida.Gadget {
 				throw new Error.PERMISSION_DENIED ("%s", e.message);
 
 			throw new Error.NOT_SUPPORTED ("%s", e.message);
+		}
+	}
+
+	private class SaucerClient : BaseController, AgentSessionProvider {
+		public override bool is_eternal {
+			get {
+				return _is_eternal;
+			}
+		}
+		private bool _is_eternal = false;
+
+		private DBusConnection connection;
+		private SaucerSession session;
+		private Gee.HashMap<AgentSessionId?, AgentEntry> agent_entries =
+			new Gee.HashMap<AgentSessionId?, AgentEntry> (AgentSessionId.hash, AgentSessionId.equal);
+
+		private Gee.ArrayList<Gum.Script> eternalized_scripts = new Gee.ArrayList<Gum.Script> ();
+
+		private Cancellable io_cancellable = new Cancellable ();
+
+		public SaucerClient (Config config, Location location) throws Error {
+			Object (config: config, location: location);
+		}
+
+		protected override async void on_start () throws Error {
+			SocketConnectable connectable = ((SocketInteraction) config.interaction).parse_socket_address ();
+
+			SocketConnection raw_connection;
+			try {
+				var client = new SocketClient ();
+				raw_connection = yield client.connect_async (connectable, io_cancellable);
+			} catch (GLib.Error e) {
+				if (e is IOError.CONNECTION_REFUSED)
+					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-saucer");
+				else
+					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-saucer: %s", e.message);
+			}
+
+			var socket = raw_connection.socket;
+			if (socket.get_family () != UNIX)
+				Tcp.enable_nodelay (socket);
+
+			try {
+				connection = yield new DBusConnection (raw_connection, null,
+					AUTHENTICATION_CLIENT | DELAY_MESSAGE_PROCESSING, null, io_cancellable);
+			} catch (GLib.Error e) {
+				throw new Error.TRANSPORT ("%s", e.message);
+			}
+
+			try {
+				AgentSessionProvider provider = this;
+				connection.register_object (ObjectPath.AGENT_SESSION_PROVIDER, provider);
+			} catch (IOError e) {
+				assert_not_reached ();
+			}
+
+			connection.start_message_processing ();
+
+			try {
+				session = yield connection.get_proxy (null, ObjectPath.SAUCER_SESSION, DBusProxyFlags.NONE, io_cancellable);
+			} catch (IOError e) {
+				throw new Error.PROTOCOL ("Incompatible frida-saucer version");
+			}
+
+			string identifier = location.bundle_id;
+			if (identifier == null)
+				identifier = get_executable_path ();
+
+			string name = location.bundle_name;
+			if (name == null)
+				name = Path.get_basename (get_executable_path ());
+
+			var pid = get_process_id ();
+
+			var no_icon = ImageData.empty ();
+
+			var info = HostApplicationInfo (identifier, name, pid, no_icon, no_icon);
+
+			SpawnStartState start_state;
+			try {
+				yield session.join (info, io_cancellable, out start_state);
+			} catch (GLib.Error e) {
+				throw new Error.TRANSPORT ("%s", e.message);
+			}
+
+			if (start_state == RUNNING)
+				Frida.Gadget.resume ();
+		}
+
+		// TODO: implement automatic reconnect
+
+		protected override async void on_terminate (TerminationReason reason) {
+		}
+
+		protected override async void on_stop () {
+			io_cancellable.cancel ();
+		}
+
+		private async void open (AgentSessionId id, Realm realm, Cancellable? cancellable) throws Error, IOError {
+			if (realm == EMULATED)
+				throw new Error.NOT_SUPPORTED ("Emulated realm is not supported by frida-gadget");
+
+			var entry = new AgentEntry (this, id);
+			agent_entries[id] = entry;
+			entry.closed.connect (on_session_closed);
+			entry.script_eternalized.connect (on_script_eternalized);
+
+			try {
+				AgentSession session = entry;
+				entry.registration_id = connection.register_object (ObjectPath.from_agent_session_id (id), session);
+			} catch (IOError io_error) {
+				assert_not_reached ();
+			}
+
+			opened (id);
+		}
+
+#if !WINDOWS
+		private async void migrate (AgentSessionId id, Socket to_socket, Cancellable? cancellable) throws Error, IOError {
+			throw new Error.NOT_SUPPORTED ("Session migration is not yet supported by frida-gadget");
+		}
+#endif
+
+		private async void unload (Cancellable? cancellable) throws Error, IOError {
+			throw new Error.NOT_SUPPORTED ("Unload is not supported by frida-gadget");
+		}
+
+		private void on_session_closed (BaseAgentSession session) {
+			AgentEntry entry = (AgentEntry) session;
+
+			closed (entry.id);
+
+			var id = entry.registration_id;
+			if (id != 0) {
+				connection.unregister_object (id);
+				entry.registration_id = 0;
+			}
+
+			entry.script_eternalized.disconnect (on_script_eternalized);
+			entry.closed.disconnect (on_session_closed);
+			agent_entries.unset (entry.id);
+		}
+
+		private void on_script_eternalized (Gum.Script script) {
+			eternalized_scripts.add (script);
+			ensure_eternalized ();
+		}
+
+		private void ensure_eternalized () {
+			if (!_is_eternal) {
+				_is_eternal = true;
+				eternalized ();
+			}
+		}
+
+		private class AgentEntry : BaseAgentSession {
+			public AgentSessionId id {
+				get;
+				construct;
+			}
+
+			public uint registration_id {
+				get;
+				set;
+			}
+
+			public AgentEntry (ProcessInvader invader, AgentSessionId id) {
+				Object (invader: invader, id: id);
+			}
 		}
 	}
 
@@ -1677,6 +1878,7 @@ namespace Frida.Gadget {
 		private extern unowned MainContext get_main_context ();
 
 		private extern string? detect_bundle_id ();
+		private extern string? detect_bundle_name ();
 		private extern string? detect_documents_dir ();
 		private extern bool has_objc_class (string name);
 
