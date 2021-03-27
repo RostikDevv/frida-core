@@ -264,16 +264,20 @@ namespace Frida.Portal {
 		}
 
 		public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws Error, IOError {
-			var result = new HostApplicationInfo[0];
-			foreach (var node in node_by_identifier.values)
-				result += HostApplicationInfo (node.identifier, node.name, node.pid, node.small_icon, node.large_icon);
+			Gee.Collection<Node> nodes = node_by_identifier.values;
+			var result = new HostApplicationInfo[nodes.size];
+			int i = 0;
+			foreach (var node in nodes)
+				result[i++] = HostApplicationInfo (node.identifier, node.name, node.pid, node.small_icon, node.large_icon);
 			return result;
 		}
 
 		public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws Error, IOError {
-			var result = new HostProcessInfo[0];
-			foreach (var node in node_by_identifier.values)
-				result += HostProcessInfo (node.pid, node.name, node.small_icon, node.large_icon);
+			Gee.Collection<Node> nodes = node_by_identifier.values;
+			var result = new HostProcessInfo[nodes.size];
+			int i = 0;
+			foreach (var node in nodes)
+				result[i++] = HostProcessInfo (node.pid, node.name, node.small_icon, node.large_icon);
 			return result;
 		}
 
