@@ -236,19 +236,6 @@ namespace Frida.Portal {
 				}
 			}
 
-			while (agent_sessions.size != 0) {
-				foreach (var entry in agent_sessions.entries) {
-					var id = entry.key;
-					var session = entry.value;
-					agent_sessions.unset (id);
-					try {
-						yield session.close (null);
-					} catch (GLib.Error e) {
-					}
-					break;
-				}
-			}
-
 			agent_sessions.clear ();
 
 			io_cancellable.cancel ();
@@ -398,8 +385,8 @@ namespace Frida.Portal {
 
 			var client = new Client (this, connection);
 			client.register_host_session (this);
-			foreach (var entry in agent_sessions.entries)
-				client.register_agent_session (entry.key, entry.value);
+			foreach (var e in agent_sessions.entries)
+				client.register_agent_session (e.key, e.value);
 			clients.set (connection, client);
 
 			connection.start_message_processing ();
@@ -415,6 +402,17 @@ namespace Frida.Portal {
 
 			Node? node = client.node;
 			if (node != null) {
+				var dead_session_ids = new Gee.ArrayList<AgentSessionId?> (AgentSessionId.equal);
+				foreach (var e in agent_sessions.entries) {
+					DBusConnection candidate = ((DBusProxy) e.value).g_connection;
+					if (candidate == connection)
+						dead_session_ids.add (e.key);
+				}
+				foreach (AgentSessionId id in dead_session_ids) {
+					on_agent_session_closed (id, agent_sessions[id]);
+					agent_session_destroyed (id, SessionDetachReason.PROCESS_TERMINATED);
+				}
+
 				node_by_pid.unset (node.pid);
 				node_by_identifier.unset (node.identifier);
 
