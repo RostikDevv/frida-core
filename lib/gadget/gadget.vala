@@ -528,6 +528,10 @@ namespace Frida.Gadget {
 		}
 	}
 
+	public void kill () {
+		_kill (get_process_id ());
+	}
+
 	private State peek_state () {
 		State result;
 
@@ -1585,7 +1589,7 @@ namespace Frida.Gadget {
 			public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
 				validate_pid (pid);
 
-				_kill (this_process.pid);
+				Frida.Gadget.kill ();
 			}
 
 			public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {
@@ -1743,6 +1747,7 @@ namespace Frida.Gadget {
 				throw new Error.PROTOCOL ("Incompatible frida-portal version");
 			}
 			session.resume.connect (Frida.Gadget.resume);
+			session.kill.connect (Frida.Gadget.kill);
 
 			string identifier = location.bundle_id;
 			if (identifier == null)

@@ -329,7 +329,11 @@ namespace Frida.Portal {
 		}
 
 		public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
+			var node = node_by_pid[pid];
+			if (node == null)
+				return;
+
+			node.portal_session.kill ();
 		}
 
 		public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {

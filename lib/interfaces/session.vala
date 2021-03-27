@@ -104,6 +104,7 @@ namespace Frida {
 		public abstract async void join (HostApplicationInfo app, Cancellable? cancellable,
 			out SpawnStartState start_state) throws GLib.Error;
 		public signal void resume ();
+		public signal void kill ();
 	}
 
 	public enum Realm {
