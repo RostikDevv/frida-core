@@ -463,7 +463,7 @@ namespace Frida.Portal {
 			string candidate = real_identifier;
 			uint serial = 2;
 			while (node_by_identifier.has_key (candidate))
-				candidate = "%s%u".printf (real_identifier, serial++);
+				candidate = "%s[%u]".printf (real_identifier, serial++);
 			string identifier = candidate;
 
 			var node = new Node (pid, identifier, app.name, app.small_icon, app.large_icon, client.connection, client,
