@@ -284,13 +284,8 @@ namespace Frida.Portal {
 		public async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
 			spawn_gating_enabled = false;
 
-			var pending = pending_spawn.values.to_array ();
-			pending_spawn.clear ();
-			foreach (var spawn in pending) {
-				spawn_removed (spawn);
-
-				resume.begin (spawn.pid, io_cancellable);
-			}
+			foreach (uint pid in pending_spawn.keys.to_array ())
+				do_resume (pid);
 		}
 
 		public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
@@ -314,6 +309,10 @@ namespace Frida.Portal {
 		}
 
 		public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
+			do_resume (pid);
+		}
+
+		private void do_resume (uint pid) {
 			HostSpawnInfo? spawn;
 			if (!pending_spawn.unset (pid, out spawn))
 				return;
@@ -410,6 +409,10 @@ namespace Frida.Portal {
 			if (node != null) {
 				node_by_pid.unset (node.pid);
 				node_by_identifier.unset (node.identifier);
+
+				HostSpawnInfo? spawn;
+				if (pending_spawn.unset (node.pid, out spawn))
+					spawn_removed (spawn);
 			}
 
 			client.close ();

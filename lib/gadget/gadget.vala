@@ -1742,7 +1742,7 @@ namespace Frida.Gadget {
 			} catch (IOError e) {
 				throw new Error.PROTOCOL ("Incompatible frida-portal version");
 			}
-			session.resume.connect (on_resume);
+			session.resume.connect (Frida.Gadget.resume);
 
 			string identifier = location.bundle_id;
 			if (identifier == null)
@@ -1770,10 +1770,6 @@ namespace Frida.Gadget {
 		}
 
 		// TODO: implement automatic reconnect
-
-		private void on_resume () {
-			Frida.Gadget.resume ();
-		}
 
 		protected override async void on_terminate (TerminationReason reason) {
 		}
