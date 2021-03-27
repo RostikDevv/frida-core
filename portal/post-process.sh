@@ -1,8 +1,8 @@
 #!/bin/bash
 
-input_saucer_path="$1"
+input_portal_path="$1"
 input_entitlements_path="$2"
-output_saucer_path="$3"
+output_portal_path="$3"
 host_os="$4"
 strip_binary="$5"
 strip_enabled="$6"
@@ -30,8 +30,8 @@ case $host_os in
     ;;
 esac
 
-intermediate_path=$output_saucer_path.tmp
-cp -a "$input_saucer_path" "$intermediate_path"
+intermediate_path=$output_portal_path.tmp
+cp -a "$input_portal_path" "$intermediate_path"
 
 if [ "$strip_enabled" = "true" ]; then
   "$strip_binary" "$intermediate_path" || exit 1
@@ -41,7 +41,7 @@ case $host_os in
   macos|ios)
     case $host_os in
       macos)
-        "$CODESIGN" -f -s "$MACOS_CERTID" -i "re.frida.Saucer" "$intermediate_path" || exit 1
+        "$CODESIGN" -f -s "$MACOS_CERTID" -i "re.frida.Portal" "$intermediate_path" || exit 1
         ;;
       ios)
         "$CODESIGN" -f -s "$IOS_CERTID" --entitlements "$input_entitlements_path" "$intermediate_path" || exit 1
@@ -50,4 +50,4 @@ case $host_os in
     ;;
 esac
 
-mv "$intermediate_path" "$output_saucer_path"
+mv "$intermediate_path" "$output_portal_path"

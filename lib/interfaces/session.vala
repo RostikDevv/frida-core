@@ -99,8 +99,8 @@ namespace Frida {
 			out string token) throws GLib.Error;
 	}
 
-	[DBus (name = "re.frida.SaucerSession14")]
-	public interface SaucerSession : Object {
+	[DBus (name = "re.frida.PortalSession14")]
+	public interface PortalSession : Object {
 		public abstract async void join (HostApplicationInfo info, Cancellable? cancellable,
 			out SpawnStartState start_state) throws GLib.Error;
 	}
@@ -1039,7 +1039,7 @@ namespace Frida {
 		public const string AGENT_CONTROLLER = "/re/frida/AgentController";
 		public const string CHILD_SESSION = "/re/frida/ChildSession";
 		public const string TRANSPORT_BROKER = "/re/frida/TransportBroker";
-		public const string SAUCER_SESSION = "/re/frida/SaucerSession";
+		public const string PORTAL_SESSION = "/re/frida/PortalSession";
 
 		public static string from_agent_session_id (AgentSessionId id) {
 			return "%s/%u".printf (AGENT_SESSION, id.handle);

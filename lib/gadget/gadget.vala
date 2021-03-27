@@ -602,7 +602,7 @@ namespace Frida.Gadget {
 #endif
 				}
 			} else if (interaction is ConnectInteraction) {
-				var client = new SaucerClient (config, location);
+				var client = new PortalClient (config, location);
 				yield client.start ();
 				ctrl = client;
 
@@ -1682,7 +1682,7 @@ namespace Frida.Gadget {
 		}
 	}
 
-	private class SaucerClient : BaseController, AgentSessionProvider {
+	private class PortalClient : BaseController, AgentSessionProvider {
 		public override bool is_eternal {
 			get {
 				return _is_eternal;
@@ -1691,7 +1691,7 @@ namespace Frida.Gadget {
 		private bool _is_eternal = false;
 
 		private DBusConnection connection;
-		private SaucerSession session;
+		private PortalSession session;
 		private Gee.HashMap<AgentSessionId?, AgentEntry> agent_entries =
 			new Gee.HashMap<AgentSessionId?, AgentEntry> (AgentSessionId.hash, AgentSessionId.equal);
 
@@ -1699,7 +1699,7 @@ namespace Frida.Gadget {
 
 		private Cancellable io_cancellable = new Cancellable ();
 
-		public SaucerClient (Config config, Location location) throws Error {
+		public PortalClient (Config config, Location location) throws Error {
 			Object (config: config, location: location);
 		}
 
@@ -1712,9 +1712,9 @@ namespace Frida.Gadget {
 				raw_connection = yield client.connect_async (connectable, io_cancellable);
 			} catch (GLib.Error e) {
 				if (e is IOError.CONNECTION_REFUSED)
-					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-saucer");
+					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-portal");
 				else
-					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-saucer: %s", e.message);
+					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-portal: %s", e.message);
 			}
 
 			var socket = raw_connection.socket;
@@ -1738,9 +1738,9 @@ namespace Frida.Gadget {
 			connection.start_message_processing ();
 
 			try {
-				session = yield connection.get_proxy (null, ObjectPath.SAUCER_SESSION, DBusProxyFlags.NONE, io_cancellable);
+				session = yield connection.get_proxy (null, ObjectPath.PORTAL_SESSION, DBusProxyFlags.NONE, io_cancellable);
 			} catch (IOError e) {
-				throw new Error.PROTOCOL ("Incompatible frida-saucer version");
+				throw new Error.PROTOCOL ("Incompatible frida-portal version");
 			}
 
 			string identifier = location.bundle_id;

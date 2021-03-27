@@ -1,4 +1,4 @@
-#include "saucer-glue.h"
+#include "portal-glue.h"
 
 #ifdef HAVE_WINDOWS
 # include <winsock2.h>
@@ -8,7 +8,7 @@
 #endif
 
 void
-frida_saucer_tcp_enable_nodelay (GSocket * socket)
+frida_portal_tcp_enable_nodelay (GSocket * socket)
 {
   g_socket_set_option (socket, IPPROTO_TCP, TCP_NODELAY, TRUE, NULL);
 }

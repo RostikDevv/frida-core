@@ -1,33 +1,33 @@
-saucer_sources = [
-  'saucer.vala',
-  'saucer-glue.c',
+portal_sources = [
+  'portal.vala',
+  'portal-glue.c',
 ]
 
 extra_link_args = []
 extra_link_depends = []
 if host_os_family == 'darwin'
-  symlist = 'frida-saucer.symbols'
+  symlist = 'frida-portal.symbols'
   extra_link_args += ['-Wl,-exported_symbols_list,' + join_paths(meson.current_source_dir(), symlist)]
   extra_link_depends += [symlist]
 elif host_os_family != 'windows'
-  symscript = 'frida-saucer.version'
+  symscript = 'frida-portal.version'
   extra_link_args += ['-Wl,--version-script,' + join_paths(meson.current_source_dir(), symscript)]
   extra_link_depends += [symscript]
 endif
 
-raw_saucer = executable('frida-saucer-raw', saucer_sources,
+raw_portal = executable('frida-portal-raw', portal_sources,
   vala_args: ['--pkg=posix'],
   link_args: extra_link_args,
   link_depends: extra_link_depends,
   dependencies: [core_dep],
 )
 
-custom_target('frida-saucer',
+custom_target('frida-portal',
   input: [
-    raw_saucer,
-    'frida-saucer.xcent',
+    raw_portal,
+    'frida-portal.xcent',
   ],
-  output: 'frida-saucer',
+  output: 'frida-portal',
   command: [
     files('post-process.sh'),
     '@INPUT@',

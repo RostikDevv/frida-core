@@ -1,4 +1,4 @@
-namespace Frida.Saucer {
+namespace Frida.Portal {
 	private static Application application;
 
 	private const string DEFAULT_LISTEN_ADDRESS = "127.0.0.1";
@@ -469,7 +469,7 @@ namespace Frida.Saucer {
 			agent_sessions.unset (id);
 		}
 
-		private class Client : Object, SaucerSession {
+		private class Client : Object, PortalSession {
 			public signal void joined (HostApplicationInfo info);
 
 			public DBusConnection connection {
@@ -511,8 +511,8 @@ namespace Frida.Saucer {
 				filter_id = connection.add_filter (on_connection_message);
 
 				try {
-					SaucerSession session = this;
-					registrations.add (connection.register_object (ObjectPath.SAUCER_SESSION, session));
+					PortalSession session = this;
+					registrations.add (connection.register_object (ObjectPath.PORTAL_SESSION, session));
 				} catch (IOError e) {
 					assert_not_reached ();
 				}

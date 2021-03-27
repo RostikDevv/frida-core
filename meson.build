@@ -279,7 +279,7 @@ subdir('tools')
 subdir('lib')
 subdir('src')
 subdir('server')
-subdir('saucer')
+subdir('portal')
 subdir('inject')
 
 if get_option('tests')
