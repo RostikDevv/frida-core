@@ -101,8 +101,9 @@ namespace Frida {
 
 	[DBus (name = "re.frida.PortalSession14")]
 	public interface PortalSession : Object {
-		public abstract async void join (HostApplicationInfo info, Cancellable? cancellable,
+		public abstract async void join (HostApplicationInfo app, Cancellable? cancellable,
 			out SpawnStartState start_state) throws GLib.Error;
+		public signal void resume ();
 	}
 
 	public enum Realm {

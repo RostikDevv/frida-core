@@ -1742,6 +1742,7 @@ namespace Frida.Gadget {
 			} catch (IOError e) {
 				throw new Error.PROTOCOL ("Incompatible frida-portal version");
 			}
+			session.resume.connect (on_resume);
 
 			string identifier = location.bundle_id;
 			if (identifier == null)
@@ -1755,11 +1756,11 @@ namespace Frida.Gadget {
 
 			var no_icon = ImageData.empty ();
 
-			var info = HostApplicationInfo (identifier, name, pid, no_icon, no_icon);
+			var app = HostApplicationInfo (identifier, name, pid, no_icon, no_icon);
 
 			SpawnStartState start_state;
 			try {
-				yield session.join (info, io_cancellable, out start_state);
+				yield session.join (app, io_cancellable, out start_state);
 			} catch (GLib.Error e) {
 				throw new Error.TRANSPORT ("%s", e.message);
 			}
@@ -1769,6 +1770,10 @@ namespace Frida.Gadget {
 		}
 
 		// TODO: implement automatic reconnect
+
+		private void on_resume () {
+			Frida.Gadget.resume ();
+		}
 
 		protected override async void on_terminate (TerminationReason reason) {
 		}

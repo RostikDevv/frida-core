@@ -142,9 +142,6 @@ namespace Frida.Portal {
 	public class Application : Object, HostSession {
 		public signal void ready ();
 
-		private Gee.HashMap<AgentSessionId?, AgentSession> agent_sessions =
-			new Gee.HashMap<AgentSessionId?, AgentSession> (AgentSessionId.hash, AgentSessionId.equal);
-
 		private SocketService server = new SocketService ();
 		private string guid = DBus.generate_guid ();
 		private Gee.HashMap<DBusConnection, Client> clients = new Gee.HashMap<DBusConnection, Client> ();
@@ -153,6 +150,10 @@ namespace Frida.Portal {
 		private Gee.HashMap<string, Node> node_by_identifier = new Gee.HashMap<string, Node> ();
 
 		private bool spawn_gating_enabled = false;
+		private Gee.HashMap<uint, HostSpawnInfo?> pending_spawn = new Gee.HashMap<uint, HostSpawnInfo?> ();
+
+		private Gee.HashMap<AgentSessionId?, AgentSession> agent_sessions =
+			new Gee.HashMap<AgentSessionId?, AgentSession> (AgentSessionId.hash, AgentSessionId.equal);
 		private uint next_agent_session_id = 1;
 
 		private Cancellable io_cancellable = new Cancellable ();
@@ -282,11 +283,22 @@ namespace Frida.Portal {
 
 		public async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
 			spawn_gating_enabled = false;
+
+			var pending = pending_spawn.values.to_array ();
+			pending_spawn.clear ();
+			foreach (var spawn in pending) {
+				spawn_removed (spawn);
+
+				resume.begin (spawn.pid, io_cancellable);
+			}
 		}
 
 		public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
-			// TODO: actually implement this
-			return {};
+			var result = new HostSpawnInfo[pending_spawn.size];
+			var index = 0;
+			foreach (var spawn in pending_spawn.values)
+				result[index++] = spawn;
+			return result;
 		}
 
 		public async HostChildInfo[] enumerate_pending_children (Cancellable? cancellable) throws Error, IOError {
@@ -302,7 +314,15 @@ namespace Frida.Portal {
 		}
 
 		public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
+			HostSpawnInfo? spawn;
+			if (!pending_spawn.unset (pid, out spawn))
+				return;
+			spawn_removed (spawn);
+
+			var node = node_by_pid[pid];
+			assert (node != null);
+
+			node.portal_session.resume ();
 		}
 
 		public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
@@ -318,9 +338,7 @@ namespace Frida.Portal {
 		}
 
 		public async AgentSessionId attach_in_realm (uint pid, Realm realm, Cancellable? cancellable) throws Error, IOError {
-			Node node = node_by_pid[pid];
-			if (node == null)
-				throw new Error.PROCESS_NOT_FOUND ("Unable to find process with pid %u", pid);
+			Node node = get_node_by_pid (pid);
 
 			var id = AgentSessionId (next_agent_session_id++);
 			AgentSession session;
@@ -349,6 +367,13 @@ namespace Frida.Portal {
 			throw new Error.NOT_SUPPORTED ("Not supported");
 		}
 
+		private Node get_node_by_pid (uint pid) throws Error {
+			var node = node_by_pid[pid];
+			if (node == null)
+				throw new Error.PROCESS_NOT_FOUND ("Unable to find process with pid %u", pid);
+			return node;
+		}
+
 		private bool on_server_connection (SocketConnection connection, Object? source_object) {
 			handle_server_connection.begin (connection);
 			return true;
@@ -364,8 +389,7 @@ namespace Frida.Portal {
 				null, io_cancellable);
 			connection.on_closed.connect (on_connection_closed);
 
-			var client = new Client (connection);
-			client.joined.connect (on_client_joined);
+			var client = new Client (this, connection);
 			client.register_host_session (this);
 			foreach (var entry in agent_sessions.entries)
 				client.register_agent_session (entry.key, entry.value);
@@ -411,7 +435,10 @@ namespace Frida.Portal {
 			}
 		}
 
-		private async void on_client_joined (Client client, HostApplicationInfo info) {
+		private async void add_node (Client client, HostApplicationInfo app, Cancellable? cancellable,
+				out SpawnStartState start_state) {
+			start_state = RUNNING;
+
 			AgentSessionProvider provider;
 			try {
 				provider = yield client.connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER, DBusProxyFlags.NONE,
@@ -421,22 +448,33 @@ namespace Frida.Portal {
 			}
 			provider.closed.connect (on_agent_session_provider_closed);
 
-			uint pid = info.pid;
+			uint pid = app.pid;
 			while (node_by_pid.has_key (pid))
 				pid++;
 
-			string real_identifier = info.identifier;
+			string real_identifier = app.identifier;
 			string candidate = real_identifier;
 			uint serial = 2;
 			while (node_by_identifier.has_key (candidate))
 				candidate = "%s%u".printf (real_identifier, serial++);
 			string identifier = candidate;
 
-			var node = new Node (pid, identifier, info.name, info.small_icon, info.large_icon, client.connection, provider);
+			var node = new Node (pid, identifier, app.name, app.small_icon, app.large_icon, client.connection, client,
+				provider);
 			node_by_pid[pid] = node;
 			node_by_identifier[identifier] = node;
 
 			client.node = node;
+
+			if (spawn_gating_enabled) {
+				var spawn = HostSpawnInfo (pid, identifier);
+				pending_spawn[pid] = spawn;
+				spawn_added (spawn);
+
+				start_state = SUSPENDED;
+			} else {
+				start_state = RUNNING;
+			}
 		}
 
 		private void on_agent_session_provider_closed (AgentSessionId id) {
@@ -470,7 +508,10 @@ namespace Frida.Portal {
 		}
 
 		private class Client : Object, PortalSession {
-			public signal void joined (HostApplicationInfo info);
+			public weak Application parent {
+				get;
+				construct;
+			}
 
 			public DBusConnection connection {
 				get;
@@ -503,8 +544,8 @@ namespace Frida.Portal {
 				new Gee.HashMap<AgentSessionId?, uint> (AgentSessionId.hash, AgentSessionId.equal);
 			private Gee.HashMap<uint32, DBusMessage> method_calls = new Gee.HashMap<uint32, DBusMessage> ();
 
-			public Client (DBusConnection connection) {
-				Object (connection: connection);
+			public Client (Application parent, DBusConnection connection) {
+				Object (parent: parent, connection: connection);
 			}
 
 			construct {
@@ -561,10 +602,9 @@ namespace Frida.Portal {
 				connection.unregister_object (registration_id);
 			}
 
-			public async void join (HostApplicationInfo info, Cancellable? cancellable,
+			public async void join (HostApplicationInfo app, Cancellable? cancellable,
 					out SpawnStartState start_state) throws Error {
-				start_state = RUNNING;
-				joined (info);
+				yield parent.add_node (this, app, cancellable, out start_state);
 			}
 
 			private void schedule_idle (owned ScheduledFunc func) {
@@ -688,13 +728,18 @@ namespace Frida.Portal {
 				construct;
 			}
 
+			public PortalSession portal_session {
+				get;
+				construct;
+			}
+
 			public AgentSessionProvider provider {
 				get;
 				construct;
 			}
 
 			public Node (uint pid, string identifier, string name, ImageData small_icon, ImageData large_icon,
-					DBusConnection connection, AgentSessionProvider provider) {
+					DBusConnection connection, PortalSession portal_session, AgentSessionProvider provider) {
 				Object (
 					pid: pid,
 					identifier: identifier,
@@ -702,6 +747,7 @@ namespace Frida.Portal {
 					small_icon: small_icon,
 					large_icon: large_icon,
 					connection: connection,
+					portal_session: portal_session,
 					provider: provider
 				);
 			}
