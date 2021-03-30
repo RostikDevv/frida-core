@@ -7,7 +7,11 @@ namespace Frida.Portal {
 	private const uint16 DEFAULT_CLUSTER_PORT = 27043;
 	private static bool output_version = false;
 	private static string? control_address = null;
+	private static string? control_certpath = null;
+	private static string? control_token = null;
 	private static string? cluster_address = null;
+	private static string? cluster_certpath = null;
+	private static string? cluster_token = null;
 #if !WINDOWS
 	private static bool daemonize = false;
 #endif
@@ -16,8 +20,16 @@ namespace Frida.Portal {
 
 	const OptionEntry[] options = {
 		{ "version", 0, 0, OptionArg.NONE, ref output_version, "Output version information and exit", null },
-		{ "control-endpoint", 0, 0, OptionArg.STRING, ref control_address, "Expose frida-server compatible endpoint on ADDRESS", "ADDRESS" },
+		{ "control-endpoint", 0, 0, OptionArg.STRING, ref control_address, "Expose control endpoint on ADDRESS", "ADDRESS" },
+		{ "control-certificate", 0, 0, OptionArg.FILENAME, ref control_certpath, "Enable TLS on control endpoint using CERTIFICATE",
+			"CERTIFICATE" },
+		{ "control-token", 0, 0, OptionArg.STRING, ref control_token, "Enable authentication on control endpoint using TOKEN",
+			"TOKEN" },
 		{ "cluster-endpoint", 0, 0, OptionArg.STRING, ref cluster_address, "Expose cluster endpoint on ADDRESS", "ADDRESS" },
+		{ "cluster-certificate", 0, 0, OptionArg.FILENAME, ref cluster_certpath, "Enable TLS on cluster endpoint using CERTIFICATE",
+			"CERTIFICATE" },
+		{ "cluster-token", 0, 0, OptionArg.STRING, ref cluster_token, "Enable authentication on cluster endpoint using TOKEN",
+			"TOKEN" },
 #if !WINDOWS
 		{ "daemonize", 'D', 0, OptionArg.NONE, ref daemonize, "Detach and become a daemon", null },
 #endif
@@ -41,13 +53,15 @@ namespace Frida.Portal {
 			return 0;
 		}
 
-		SocketConnectable control_connectable, cluster_connectable;
+		EndpointParameters control_params, cluster_params;
 		try {
-			control_connectable = parse_socket_address (control_address, DEFAULT_CONTROL_ADDRESS, DEFAULT_CONTROL_PORT);
-			cluster_connectable = parse_socket_address (cluster_address, DEFAULT_CLUSTER_ADDRESS, DEFAULT_CLUSTER_PORT);
+			control_params = EndpointParameters.parse (CONTROL, control_address, DEFAULT_CONTROL_ADDRESS, DEFAULT_CONTROL_PORT,
+				control_certpath, control_token);
+			cluster_params = EndpointParameters.parse (CLUSTER, cluster_address, DEFAULT_CLUSTER_ADDRESS, DEFAULT_CLUSTER_PORT,
+				cluster_certpath, cluster_token);
 		} catch (GLib.Error e) {
 			printerr ("%s\n", e.message);
-			return 1;
+			return 2;
 		}
 
 		ReadyHandler? on_ready = null;
@@ -73,7 +87,7 @@ namespace Frida.Portal {
 					sync_in.read (status);
 					return status[0];
 				} catch (GLib.Error e) {
-					return 2;
+					return 3;
 				}
 			}
 
@@ -102,12 +116,7 @@ namespace Frida.Portal {
 		}
 #endif
 
-		return run_application (control_connectable, cluster_connectable, on_ready);
-	}
-
-	private static int run_application (SocketConnectable control_connectable, SocketConnectable cluster_connectable,
-			ReadyHandler on_ready) {
-		application = new Application ();
+		application = new Application (control_params, cluster_params);
 
 		Posix.signal (Posix.Signal.INT, (sig) => {
 			application.stop ();
@@ -123,15 +132,25 @@ namespace Frida.Portal {
 			});
 		}
 
-		return application.run (control_connectable, cluster_connectable);
+		return application.run ();
 	}
 
 	namespace Tcp {
 		public extern void enable_nodelay (Socket socket);
 	}
 
-	public class Application : Object {
+	private class Application : Object {
 		public signal void ready ();
+
+		public EndpointParameters control_parameters {
+			get;
+			construct;
+		}
+
+		public EndpointParameters cluster_parameters {
+			get;
+			construct;
+		}
 
 		private SocketService server = new SocketService ();
 		private string guid = DBus.generate_guid ();
@@ -144,7 +163,6 @@ namespace Frida.Portal {
 		private Gee.Map<uint, PendingSpawn> pending_spawn = new Gee.HashMap<uint, PendingSpawn> ();
 		private Gee.Map<AgentSessionId?, ControlChannel> sessions =
 			new Gee.HashMap<AgentSessionId?, ControlChannel> (AgentSessionId.hash, AgentSessionId.equal);
-
 		private uint next_agent_session_id = 1;
 
 		private Cancellable io_cancellable = new Cancellable ();
@@ -153,13 +171,17 @@ namespace Frida.Portal {
 		private MainLoop loop;
 		private bool stopping;
 
+		public Application (EndpointParameters control_parameters, EndpointParameters cluster_parameters) {
+			Object (control_parameters: control_parameters, cluster_parameters: cluster_parameters);
+		}
+
 		construct {
 			server.incoming.connect (on_incoming_connection);
 		}
 
-		public int run (SocketConnectable control_connectable, SocketConnectable cluster_connectable) {
+		public int run () {
 			Idle.add (() => {
-				start.begin (control_connectable, cluster_connectable);
+				start.begin ();
 				return false;
 			});
 
@@ -171,10 +193,10 @@ namespace Frida.Portal {
 			return exit_code;
 		}
 
-		private async void start (SocketConnectable control_connectable, SocketConnectable cluster_connectable) {
+		private async void start () {
 			try {
-				yield listen_on (control_connectable, new ControlSourceTag ());
-				yield listen_on (cluster_connectable, new ClusterSourceTag ());
+				yield add_endpoint (control_parameters);
+				yield add_endpoint (cluster_parameters);
 			} catch (GLib.Error e) {
 				printerr ("Unable to start: %s\n", e.message);
 				exit_code = 3;
@@ -190,12 +212,12 @@ namespace Frida.Portal {
 			});
 		}
 
-		private async void listen_on (SocketConnectable connectable, Object source) throws GLib.Error {
-			var enumerator = connectable.enumerate ();
+		private async void add_endpoint (EndpointParameters parameters) throws GLib.Error {
+			var enumerator = parameters.connectable.enumerate ();
 			SocketAddress? address;
 			while ((address = yield enumerator.next_async (io_cancellable)) != null) {
 				SocketAddress effective_address;
-				server.add_address (address, SocketType.STREAM, SocketProtocol.DEFAULT, source, out effective_address);
+				server.add_address (address, SocketType.STREAM, SocketProtocol.DEFAULT, parameters, out effective_address);
 			}
 		}
 
@@ -226,68 +248,125 @@ namespace Frida.Portal {
 		}
 
 		private bool on_incoming_connection (SocketConnection connection, Object? source_object) {
-			on_connection_opened.begin (connection, source_object);
+			var parameters = (EndpointParameters) source_object;
+			on_connection_opened.begin (connection, parameters);
 			return true;
 		}
 
-		private async void on_connection_opened (SocketConnection socket_connection, Object? source_object) throws GLib.Error {
+		private async void on_connection_opened (SocketConnection socket_connection,
+				EndpointParameters parameters) throws GLib.Error {
 			var socket = socket_connection.socket;
 			if (socket.get_family () != UNIX)
 				Tcp.enable_nodelay (socket);
 
-			var connection = yield new DBusConnection (socket_connection, guid,
-				AUTHENTICATION_SERVER | AUTHENTICATION_ALLOW_ANONYMOUS | DELAY_MESSAGE_PROCESSING,
-				null, io_cancellable);
+			IOStream stream = socket_connection;
+
+			TlsCertificate? certificate = parameters.certificate;
+			if (certificate != null) {
+				var tls_conn = TlsServerConnection.new (stream, certificate);
+				yield tls_conn.handshake_async (Priority.DEFAULT, io_cancellable);
+				stream = tls_conn;
+			}
+
+			var connection = yield new DBusConnection (stream, guid,
+				AUTHENTICATION_SERVER | AUTHENTICATION_ALLOW_ANONYMOUS | DELAY_MESSAGE_PROCESSING, null, io_cancellable);
 			connection.on_closed.connect (on_connection_closed);
 
 			Peer peer;
-			if (source_object is ControlSourceTag) {
-				var channel = new ControlChannel (this, connection);
-				peer = channel;
-
-				connection.start_message_processing ();
-			} else {
-				assert (source_object is ClusterSourceTag);
-
-				var node = new ClusterNode (this, connection);
-				node.session_closed.connect (on_agent_session_closed);
-				peer = node;
-
-				connection.start_message_processing ();
-
-				node.session_provider = yield connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER,
-					DBusProxyFlags.NONE, io_cancellable);
-			}
-			peers.set (connection, peer);
+			if (parameters.token_hash != null)
+				peer = setup_unauthorized_peer (connection, parameters);
+			else
+				peer = yield setup_authorized_peer (connection, parameters);
+			peers[connection] = peer;
 		}
 
 		private void on_connection_closed (DBusConnection connection, bool remote_peer_vanished, GLib.Error? error) {
-			bool closed_by_us = (!remote_peer_vanished && error == null);
-			if (closed_by_us)
-				return;
-
 			Peer peer;
 			peers.unset (connection, out peer);
+			peer.close ();
+		}
 
-			ControlChannel? channel = peer as ControlChannel;
-			if (channel != null) {
-				foreach (var session in channel.sessions.values)
-					session.close.begin (io_cancellable);
+		private Peer setup_unauthorized_peer (DBusConnection connection, EndpointParameters parameters) {
+			var channel = new AuthenticationChannel (this, connection, parameters);
 
-				disable_spawn_gating (channel);
-			} else {
-				assert (peer is ClusterNode);
-				ClusterNode node = (ClusterNode) peer;
-				ClusterMembership membership = node.membership;
-
-				foreach (var id in node.sessions) {
-					ControlChannel c;
-					if (sessions.unset (id, out c)) {
-						c.unregister_agent_session (id);
-						c.agent_session_destroyed (id, SessionDetachReason.PROCESS_TERMINATED);
-					}
+			try {
+				if (parameters.protocol == CONTROL) {
+					HostSession host_session = new UnauthorizedHostSession ();
+					channel.take_registration (connection.register_object (ObjectPath.HOST_SESSION, host_session));
+				} else {
+					PortalSession portal_session = new UnauthorizedPortalSession ();
+					channel.take_registration (connection.register_object (ObjectPath.PORTAL_SESSION, portal_session));
 				}
+			} catch (GLib.Error e) {
+				assert_not_reached ();
+			}
 
+			connection.start_message_processing ();
+
+			return channel;
+		}
+
+		private async void promote_authentication_channel (AuthenticationChannel channel) throws GLib.Error {
+			DBusConnection connection = channel.connection;
+
+			peers.unset (connection);
+			channel.close ();
+
+			peers[connection] = yield setup_authorized_peer (connection, channel.parameters);
+		}
+
+		private void kick_authentication_channel (AuthenticationChannel channel) {
+			Idle.add (() => {
+				channel.connection.close.begin (io_cancellable);
+				return false;
+			});
+		}
+
+		private async Peer setup_authorized_peer (DBusConnection connection, EndpointParameters parameters) throws GLib.Error {
+			if (parameters.protocol == CONTROL)
+				return setup_control_channel (connection);
+			else
+				return yield setup_cluster_node (connection);
+		}
+
+		private ControlChannel setup_control_channel (DBusConnection connection) {
+			var channel = new ControlChannel (this, connection);
+
+			connection.start_message_processing ();
+
+			return channel;
+		}
+
+		private void teardown_control_channel (ControlChannel channel) {
+			foreach (var session in channel.sessions.values)
+				session.close.begin (io_cancellable);
+
+			disable_spawn_gating (channel);
+		}
+
+		private async ClusterNode setup_cluster_node (DBusConnection connection) throws GLib.Error {
+			var node = new ClusterNode (this, connection);
+			node.session_closed.connect (on_agent_session_closed);
+
+			connection.start_message_processing ();
+
+			node.session_provider = yield connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER,
+				DBusProxyFlags.NONE, io_cancellable);
+
+			return node;
+		}
+
+		private void teardown_cluster_node (ClusterNode node) {
+			foreach (var id in node.sessions) {
+				ControlChannel c;
+				if (sessions.unset (id, out c)) {
+					c.unregister_agent_session (id);
+					c.agent_session_destroyed (id, SessionDetachReason.PROCESS_TERMINATED);
+				}
+			}
+
+			ClusterMembership? membership = node.membership;
+			if (membership != null) {
 				node_by_pid.unset (membership.pid);
 				node_by_identifier.unset (membership.identifier);
 
@@ -295,8 +374,6 @@ namespace Frida.Portal {
 				if (pending_spawn.unset (membership.pid, out spawn))
 					notify_spawn_removed (spawn.info);
 			}
-
-			peer.close ();
 		}
 
 		private HostApplicationInfo[] enumerate_applications () {
@@ -385,7 +462,7 @@ namespace Frida.Portal {
 		private async void handle_join_request (ClusterNode node, HostApplicationInfo app, Cancellable? cancellable,
 				out SpawnStartState start_state) throws Error {
 			if (node.membership != null)
-				throw new Error.PROTOCOL ("Node has already joined");
+				throw new Error.PROTOCOL ("Already joined");
 			if (node.session_provider == null)
 				throw new Error.PROTOCOL ("Missing session provider");
 
@@ -434,14 +511,62 @@ namespace Frida.Portal {
 			}
 		}
 
-		private class ControlSourceTag : Object {
-		}
-
-		private class ClusterSourceTag : Object {
-		}
-
 		private interface Peer : Object {
 			public abstract void close ();
+		}
+
+		private class AuthenticationChannel : Object, Peer, AuthenticationService {
+			public weak Application parent {
+				get;
+				construct;
+			}
+
+			public DBusConnection connection {
+				get;
+				construct;
+			}
+
+			public EndpointParameters parameters {
+				get;
+				construct;
+			}
+
+			private Gee.Collection<uint> registrations = new Gee.ArrayList<uint> ();
+
+			public AuthenticationChannel (Application parent, DBusConnection connection, EndpointParameters parameters) {
+				Object (
+					parent: parent,
+					connection: connection,
+					parameters: parameters
+				);
+			}
+
+			public void close () {
+				foreach (var id in registrations)
+					connection.unregister_object (id);
+				registrations.clear ();
+			}
+
+			public void take_registration (uint id) {
+				registrations.add (id);
+			}
+
+			public async void authenticate (string token, Cancellable? cancellable) throws GLib.Error {
+				string actual_hash = Checksum.compute_for_string (SHA256, token);
+				string expected_hash = parameters.token_hash;
+
+				uint accumulator = 0;
+				for (uint i = 0; i != actual_hash.length; i++) {
+					accumulator |= actual_hash[i] ^ expected_hash[i];
+				}
+
+				if (accumulator == 0) {
+					yield parent.promote_authentication_channel (this);
+				} else {
+					parent.kick_authentication_channel (this);
+					throw new Error.INVALID_ARGUMENT ("Incorrect token");
+				}
+			}
 		}
 
 		private class ControlChannel : Object, Peer, HostSession {
@@ -478,10 +603,12 @@ namespace Frida.Portal {
 			}
 
 			public void close () {
+				parent.teardown_control_channel (this);
+
 				agent_registrations.clear ();
 
-				foreach (var registration_id in registrations)
-					connection.unregister_object (registration_id);
+				foreach (var id in registrations)
+					connection.unregister_object (id);
 				registrations.clear ();
 			}
 
@@ -632,8 +759,10 @@ namespace Frida.Portal {
 			}
 
 			public void close () {
-				foreach (var registration_id in registrations)
-					connection.unregister_object (registration_id);
+				parent.teardown_cluster_node (this);
+
+				foreach (var id in registrations)
+					connection.unregister_object (id);
 				registrations.clear ();
 			}
 
@@ -735,7 +864,130 @@ namespace Frida.Portal {
 		}
 	}
 
-	private static SocketConnectable parse_socket_address (string? configured_address, string default_address,
+	private enum EndpointProtocol {
+		CONTROL,
+		CLUSTER
+	}
+
+	private class EndpointParameters : Object {
+		public EndpointProtocol protocol {
+			get;
+			construct;
+		}
+
+		public SocketConnectable connectable {
+			get;
+			construct;
+		}
+
+		public TlsCertificate? certificate {
+			get;
+			construct;
+		}
+
+		public string? token_hash {
+			get;
+			construct;
+		}
+
+		public EndpointParameters (EndpointProtocol protocol, SocketConnectable connectable, TlsCertificate? certificate,
+				string? token) {
+			Object (
+				protocol: protocol,
+				connectable: connectable,
+				certificate: certificate,
+				token_hash: (token != null) ? Checksum.compute_for_string (SHA256, token) : null
+			);
+		}
+
+		public static EndpointParameters parse (EndpointProtocol protocol, string? configured_address, string default_address,
+				uint16 default_port, string? certificate_path, string? token) throws GLib.Error {
+			SocketConnectable connectable = parse_socket_address (configured_address, default_address, default_port);
+
+			TlsCertificate? certificate = (certificate_path != null)
+				? new TlsCertificate.from_file (certificate_path)
+				: null;
+
+			return new EndpointParameters (protocol, connectable, certificate, token);
+		}
+	}
+
+	private class UnauthorizedHostSession : Object, HostSession {
+		public async HostApplicationInfo get_frontmost_application (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async void enable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async HostChildInfo[] enumerate_pending_children (Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async void input (uint pid, uint8[] data, Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async AgentSessionId attach_in_realm (uint pid, Realm realm, Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data,
+				Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+
+		public async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data,
+				Cancellable? cancellable) throws Error, IOError {
+			throw_not_authorized ();
+		}
+	}
+
+	private class UnauthorizedPortalSession : Object, PortalSession {
+		public async void join (HostApplicationInfo app, Cancellable? cancellable, out SpawnStartState start_state) throws Error {
+			throw_not_authorized ();
+		}
+	}
+
+	[NoReturn]
+	private void throw_not_authorized () throws Error {
+		throw new Error.PERMISSION_DENIED ("Not authorized, authentication required");
+	}
+
+	private SocketConnectable parse_socket_address (string? configured_address, string default_address,
 			uint16 default_port) throws GLib.Error {
 		string address = (configured_address != null) ? configured_address : default_address;
 #if !WINDOWS

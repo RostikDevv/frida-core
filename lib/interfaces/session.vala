@@ -107,6 +107,11 @@ namespace Frida {
 		public signal void kill ();
 	}
 
+	[DBus (name = "re.frida.AuthenticationService14")]
+	public interface AuthenticationService : Object {
+		public abstract async void authenticate (string token, Cancellable? cancellable) throws GLib.Error;
+	}
+
 	public enum Realm {
 		NATIVE,
 		EMULATED;
@@ -1042,6 +1047,7 @@ namespace Frida {
 		public const string CHILD_SESSION = "/re/frida/ChildSession";
 		public const string TRANSPORT_BROKER = "/re/frida/TransportBroker";
 		public const string PORTAL_SESSION = "/re/frida/PortalSession";
+		public const string AUTHENTICATION_SERVICE = "/re/frida/AuthenticationService";
 
 		public static string from_agent_session_id (AgentSessionId id) {
 			return "%s/%u".printf (AGENT_SESSION, id.handle);
