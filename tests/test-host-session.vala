@@ -340,7 +340,7 @@ namespace Frida.HostSessionTest {
 				get { return HostSessionProviderKind.LOCAL; }
 			}
 
-			public async HostSession create (string? location, Cancellable? cancellable) throws Error, IOError {
+			public async HostSession create (HostSessionOptions? options, Cancellable? cancellable) throws Error, IOError {
 				throw new Error.NOT_SUPPORTED ("Not implemented");
 			}
 

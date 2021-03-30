@@ -53,9 +53,28 @@ namespace Frida {
 			io_cancellable.cancel ();
 		}
 
-		public async HostSession create (string? location, Cancellable? cancellable) throws Error, IOError {
+		public async HostSession create (HostSessionOptions? options, Cancellable? cancellable) throws Error, IOError {
 			SocketConnectable connectable;
-			string raw_address = (location != null) ? location : DEFAULT_SERVER_ADDRESS;
+
+			string raw_address = DEFAULT_SERVER_ADDRESS;
+			TlsCertificate? certificate = null;
+			string? token = null;
+			if (options != null) {
+				var opts = options.map;
+
+				Value? address_val = opts["address"];
+				if (address_val != null)
+					raw_address = address_val.get_string ();
+
+				Value? cert_val = opts["certificate"];
+				if (cert_val != null)
+					certificate = (TlsCertificate) cert_val.get_object ();
+
+				Value? token_val = opts["token"];
+				if (token_val != null)
+					token = token_val.get_string ();
+			}
+
 #if !WINDOWS
 			if (raw_address.has_prefix ("unix:")) {
 				string path = raw_address.substring (5);
@@ -76,10 +95,10 @@ namespace Frida {
 				}
 			}
 
-			SocketConnection raw_connection;
+			SocketConnection socket_connection;
 			try {
 				var client = new SocketClient ();
-				raw_connection = yield client.connect_async (connectable, cancellable);
+				socket_connection = yield client.connect_async (connectable, cancellable);
 			} catch (GLib.Error e) {
 				if (e is IOError.CONNECTION_REFUSED)
 					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-server");
@@ -87,15 +106,43 @@ namespace Frida {
 					throw new Error.SERVER_NOT_RUNNING ("Unable to connect to remote frida-server: %s", e.message);
 			}
 
-			var socket = raw_connection.socket;
+			var socket = socket_connection.socket;
 			if (socket.get_family () != UNIX)
 				Tcp.enable_nodelay (socket);
 
+			IOStream stream = socket_connection;
+
+			if (certificate != null) {
+				try {
+					var tls_conn = TlsClientConnection.new (stream, null);
+					yield tls_conn.handshake_async (Priority.DEFAULT, cancellable);
+					stream = tls_conn;
+				} catch (GLib.Error e) {
+					throw new Error.TRANSPORT ("%s", e.message);
+				}
+			}
+
 			DBusConnection connection;
 			try {
-				connection = yield new DBusConnection (raw_connection, null, AUTHENTICATION_CLIENT, null, cancellable);
+				connection = yield new DBusConnection (stream, null, AUTHENTICATION_CLIENT, null, cancellable);
 			} catch (GLib.Error e) {
 				throw new Error.TRANSPORT ("%s", e.message);
+			}
+
+			if (token != null) {
+				AuthenticationService auth_service;
+				try {
+					auth_service = yield connection.get_proxy (null, ObjectPath.AUTHENTICATION_SERVICE,
+						DBusProxyFlags.NONE, cancellable);
+				} catch (IOError e) {
+					throw new Error.PROTOCOL ("Incompatible frida-server version");
+				}
+
+				try {
+					yield auth_service.authenticate (token, cancellable);
+				} catch (GLib.Error e) {
+					throw new Error.INVALID_ARGUMENT ("Authentication failed (%s)", e.message);
+				}
 			}
 
 			HostSession host_session;

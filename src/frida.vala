@@ -208,7 +208,8 @@ namespace Frida {
 			}
 		}
 
-		public async Device add_remote_device (string location, Cancellable? cancellable = null) throws Error, IOError {
+		public async Device add_remote_device (string location, RemoteDeviceOptions? options = null,
+				Cancellable? cancellable = null) throws Error, IOError {
 			check_open ();
 
 			var socket_device = yield get_device ((device) => {
@@ -222,7 +223,22 @@ namespace Frida {
 					return device;
 			}
 
-			var device = new Device (this, id, location, HostSessionProviderKind.REMOTE, socket_device.provider, location);
+			unowned string name = location;
+
+			var raw_options = new HostSessionOptions ();
+			var opts = raw_options.map;
+			opts["address"] = location;
+			if (options != null) {
+				TlsCertificate? cert = options.certificate;
+				if (cert != null)
+					opts["certificate"] = cert;
+
+				string? token = options.token;
+				if (token != null)
+					opts["token"] = token;
+			}
+
+			var device = new Device (this, id, name, HostSessionProviderKind.REMOTE, socket_device.provider, raw_options);
 			devices.add (device);
 			added (device);
 			changed ();
@@ -230,17 +246,20 @@ namespace Frida {
 			return device;
 		}
 
-		public Device add_remote_device_sync (string location, Cancellable? cancellable = null) throws Error, IOError {
+		public Device add_remote_device_sync (string location, RemoteDeviceOptions? options = null,
+				Cancellable? cancellable = null) throws Error, IOError {
 			var task = create<AddRemoteDeviceTask> ();
 			task.location = location;
+			task.options = options;
 			return task.execute (cancellable);
 		}
 
 		private class AddRemoteDeviceTask : ManagerTask<Device> {
 			public string location;
+			public RemoteDeviceOptions? options;
 
 			protected override async Device perform_operation () throws Error, IOError {
-				return yield parent.add_remote_device (location, cancellable);
+				return yield parent.add_remote_device (location, options, cancellable);
 			}
 		}
 
@@ -493,7 +512,7 @@ namespace Frida {
 
 		public delegate bool ProcessPredicate (Process process);
 
-		private string? location;
+		private HostSessionOptions? host_session_options;
 		private Promise<HostSession>? host_session_request;
 		private Promise<bool>? close_request;
 
@@ -505,7 +524,7 @@ namespace Frida {
 			new Gee.HashMap<AgentSessionId?, Promise<bool>> (AgentSessionId.hash, AgentSessionId.equal);
 
 		public Device (DeviceManager manager, string id, string name, HostSessionProviderKind kind, HostSessionProvider provider,
-				string? location = null) {
+				HostSessionOptions? options = null) {
 			DeviceType dtype;
 			switch (kind) {
 				case HostSessionProviderKind.LOCAL:
@@ -531,7 +550,7 @@ namespace Frida {
 				main_context: manager.main_context
 			);
 
-			this.location = location;
+			host_session_options = options;
 		}
 
 		construct {
@@ -1218,7 +1237,7 @@ namespace Frida {
 			host_session_request = new Promise<HostSession> ();
 
 			try {
-				var session = yield provider.create (location, cancellable);
+				var session = yield provider.create (host_session_options, cancellable);
 				attach_host_session (session);
 
 				current_host_session = session;
@@ -1420,6 +1439,18 @@ namespace Frida {
 
 		public string to_nick () {
 			return Marshal.enum_to_nick<DeviceType> (this);
+		}
+	}
+
+	public class RemoteDeviceOptions : Object {
+		public TlsCertificate? certificate {
+			get;
+			set;
+		}
+
+		public string? token {
+			get;
+			set;
 		}
 	}
 

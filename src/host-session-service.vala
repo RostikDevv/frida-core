@@ -119,7 +119,7 @@ namespace Frida {
 			get;
 		}
 
-		public abstract async HostSession create (string? location = null, Cancellable? cancellable = null) throws Error, IOError;
+		public abstract async HostSession create (HostSessionOptions? options = null, Cancellable? cancellable = null) throws Error, IOError;
 		public abstract async void destroy (HostSession session, Cancellable? cancellable = null) throws Error, IOError;
 		public signal void host_session_closed (HostSession session);
 
@@ -131,6 +131,14 @@ namespace Frida {
 		LOCAL,
 		REMOTE,
 		USB
+	}
+
+	public class HostSessionOptions : Object {
+		public Gee.Map<string, Value?> map {
+			get;
+			construct;
+			default = new Gee.HashMap<string, Value?> ();
+		}
 	}
 
 	public interface ChannelProvider : Object {
