@@ -247,6 +247,12 @@ namespace Frida.Gadget {
 	}
 
 	private class ListenInteraction : SocketInteraction {
+		public uint port {
+			get;
+			set;
+			default = 27042;
+		}
+
 		public PortConflictBehavior on_port_conflict {
 			get;
 			set;
@@ -255,6 +261,11 @@ namespace Frida.Gadget {
 	}
 
 	private class ConnectInteraction : SocketInteraction {
+		public uint port {
+			get;
+			set;
+			default = 27043;
+		}
 	}
 
 	private abstract class SocketInteraction : Object {
@@ -264,36 +275,10 @@ namespace Frida.Gadget {
 			default = "127.0.0.1";
 		}
 
-		public uint port {
-			get;
-			set;
-			default = 27042;
-		}
-
 		public LoadBehavior on_load {
 			get;
 			set;
 			default = LoadBehavior.WAIT;
-		}
-
-		public SocketAddress parse_socket_address () throws Error {
-#if !WINDOWS
-			if (address.has_prefix ("unix:")) {
-				string path = address.substring (5);
-
-				UnixSocketAddressType type = UnixSocketAddress.abstract_names_supported ()
-					? UnixSocketAddressType.ABSTRACT
-					: UnixSocketAddressType.PATH;
-
-				return new UnixSocketAddress.with_type (path, -1, type);
-			}
-#endif
-
-			var inet_address = new InetSocketAddress.from_string (address, port);
-			if (inet_address == null)
-				throw new Error.INVALID_ARGUMENT ("Invalid address");
-
-			return inet_address;
 		}
 	}
 
@@ -1363,8 +1348,9 @@ namespace Frida.Gadget {
 		private Cancellable io_cancellable = new Cancellable ();
 
 		public Server (Config config, Location location) throws Error {
+			var interaction = (ListenInteraction) config.interaction;
 			Object (
-				listen_address: ((SocketInteraction) config.interaction).parse_socket_address (),
+				listen_address: parse_socket_address (interaction.address, interaction.port),
 				config: config,
 				location: location
 			);
@@ -1708,7 +1694,8 @@ namespace Frida.Gadget {
 		}
 
 		protected override async void on_start () throws Error {
-			SocketConnectable connectable = ((SocketInteraction) config.interaction).parse_socket_address ();
+			var interaction = (ConnectInteraction) config.interaction;
+			SocketConnectable connectable = parse_socket_address (interaction.address, interaction.port);
 
 			SocketConnection raw_connection;
 			try {
@@ -1871,8 +1858,28 @@ namespace Frida.Gadget {
 		return Path.build_filename (dirname, stem + ".config");
 	}
 
-	private static Json.Node make_empty_json_object () {
+	private Json.Node make_empty_json_object () {
 		return new Json.Node.alloc ().init_object (new Json.Object ());
+	}
+
+	private SocketAddress parse_socket_address (string address, uint port) throws Error {
+#if !WINDOWS
+		if (address.has_prefix ("unix:")) {
+			string path = address.substring (5);
+
+			UnixSocketAddressType type = UnixSocketAddress.abstract_names_supported ()
+				? UnixSocketAddressType.ABSTRACT
+				: UnixSocketAddressType.PATH;
+
+			return new UnixSocketAddress.with_type (path, -1, type);
+		}
+#endif
+
+		var inet_address = new InetSocketAddress.from_string (address, port);
+		if (inet_address == null)
+			throw new Error.INVALID_ARGUMENT ("Invalid address");
+
+		return inet_address;
 	}
 
 	namespace Environment {

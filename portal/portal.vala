@@ -1,10 +1,13 @@
 namespace Frida.Portal {
 	private static Application application;
 
-	private const string DEFAULT_LISTEN_ADDRESS = "127.0.0.1";
-	private const uint16 DEFAULT_LISTEN_PORT = 27042;
+	private const string DEFAULT_CONTROL_ADDRESS = "127.0.0.1";
+	private const uint16 DEFAULT_CONTROL_PORT = 27042;
+	private const string DEFAULT_CLUSTER_ADDRESS = "127.0.0.1";
+	private const uint16 DEFAULT_CLUSTER_PORT = 27043;
 	private static bool output_version = false;
-	private static string? listen_address = null;
+	private static string? control_address = null;
+	private static string? cluster_address = null;
 #if !WINDOWS
 	private static bool daemonize = false;
 #endif
@@ -13,7 +16,8 @@ namespace Frida.Portal {
 
 	const OptionEntry[] options = {
 		{ "version", 0, 0, OptionArg.NONE, ref output_version, "Output version information and exit", null },
-		{ "listen", 'l', 0, OptionArg.STRING, ref listen_address, "Listen on ADDRESS", "ADDRESS" },
+		{ "control-endpoint", 0, 0, OptionArg.STRING, ref control_address, "Expose frida-server compatible endpoint on ADDRESS", "ADDRESS" },
+		{ "cluster-endpoint", 0, 0, OptionArg.STRING, ref cluster_address, "Expose cluster endpoint on ADDRESS", "ADDRESS" },
 #if !WINDOWS
 		{ "daemonize", 'D', 0, OptionArg.NONE, ref daemonize, "Detach and become a daemon", null },
 #endif
@@ -37,27 +41,13 @@ namespace Frida.Portal {
 			return 0;
 		}
 
-		SocketConnectable connectable;
-		string raw_address = (listen_address != null) ? listen_address : DEFAULT_LISTEN_ADDRESS;
-#if !WINDOWS
-		if (raw_address.has_prefix ("unix:")) {
-			string path = raw_address.substring (5);
-
-			UnixSocketAddressType type = UnixSocketAddress.abstract_names_supported ()
-				? UnixSocketAddressType.ABSTRACT
-				: UnixSocketAddressType.PATH;
-
-			connectable = new UnixSocketAddress.with_type (path, -1, type);
-		} else {
-#else
-		{
-#endif
-			try {
-				connectable = NetworkAddress.parse (raw_address, DEFAULT_LISTEN_PORT);
-			} catch (GLib.Error e) {
-				printerr ("%s\n", e.message);
-				return 1;
-			}
+		SocketConnectable control_connectable, cluster_connectable;
+		try {
+			control_connectable = parse_socket_address (control_address, DEFAULT_CONTROL_ADDRESS, DEFAULT_CONTROL_PORT);
+			cluster_connectable = parse_socket_address (cluster_address, DEFAULT_CLUSTER_ADDRESS, DEFAULT_CLUSTER_PORT);
+		} catch (GLib.Error e) {
+			printerr ("%s\n", e.message);
+			return 1;
 		}
 
 		ReadyHandler? on_ready = null;
@@ -112,10 +102,11 @@ namespace Frida.Portal {
 		}
 #endif
 
-		return run_application (connectable, on_ready);
+		return run_application (control_connectable, cluster_connectable, on_ready);
 	}
 
-	private static int run_application (SocketConnectable connectable, ReadyHandler on_ready) {
+	private static int run_application (SocketConnectable control_connectable, SocketConnectable cluster_connectable,
+			ReadyHandler on_ready) {
 		application = new Application ();
 
 		Posix.signal (Posix.Signal.INT, (sig) => {
@@ -132,28 +123,28 @@ namespace Frida.Portal {
 			});
 		}
 
-		return application.run (connectable);
+		return application.run (control_connectable, cluster_connectable);
 	}
 
 	namespace Tcp {
 		public extern void enable_nodelay (Socket socket);
 	}
 
-	public class Application : Object, HostSession {
+	public class Application : Object {
 		public signal void ready ();
 
 		private SocketService server = new SocketService ();
 		private string guid = DBus.generate_guid ();
-		private Gee.HashMap<DBusConnection, Client> clients = new Gee.HashMap<DBusConnection, Client> ();
+		private Gee.Map<DBusConnection, Peer> peers = new Gee.HashMap<DBusConnection, Peer> ();
 
-		private Gee.HashMap<uint, Node> node_by_pid = new Gee.HashMap<uint, Node> ();
-		private Gee.HashMap<string, Node> node_by_identifier = new Gee.HashMap<string, Node> ();
+		private Gee.Map<uint, ClusterNode> node_by_pid = new Gee.HashMap<uint, ClusterNode> ();
+		private Gee.Map<string, ClusterNode> node_by_identifier = new Gee.HashMap<string, ClusterNode> ();
 
-		private bool spawn_gating_enabled = false;
-		private Gee.HashMap<uint, HostSpawnInfo?> pending_spawn = new Gee.HashMap<uint, HostSpawnInfo?> ();
+		private Gee.Set<ControlChannel> spawn_gaters = new Gee.HashSet<ControlChannel> ();
+		private Gee.Map<uint, PendingSpawn> pending_spawn = new Gee.HashMap<uint, PendingSpawn> ();
+		private Gee.Map<AgentSessionId?, ControlChannel> sessions =
+			new Gee.HashMap<AgentSessionId?, ControlChannel> (AgentSessionId.hash, AgentSessionId.equal);
 
-		private Gee.HashMap<AgentSessionId?, AgentSession> agent_sessions =
-			new Gee.HashMap<AgentSessionId?, AgentSession> (AgentSessionId.hash, AgentSessionId.equal);
 		private uint next_agent_session_id = 1;
 
 		private Cancellable io_cancellable = new Cancellable ();
@@ -163,12 +154,12 @@ namespace Frida.Portal {
 		private bool stopping;
 
 		construct {
-			server.incoming.connect (on_server_connection);
+			server.incoming.connect (on_incoming_connection);
 		}
 
-		public int run (SocketConnectable connectable) {
+		public int run (SocketConnectable control_connectable, SocketConnectable cluster_connectable) {
 			Idle.add (() => {
-				start.begin (connectable);
+				start.begin (control_connectable, cluster_connectable);
 				return false;
 			});
 
@@ -180,15 +171,10 @@ namespace Frida.Portal {
 			return exit_code;
 		}
 
-		private async void start (SocketConnectable connectable) {
-			var enumerator = connectable.enumerate ();
-			SocketAddress? address;
+		private async void start (SocketConnectable control_connectable, SocketConnectable cluster_connectable) {
 			try {
-				while ((address = yield enumerator.next_async (io_cancellable)) != null) {
-					SocketAddress effective_address;
-					server.add_address (address, SocketType.STREAM, SocketProtocol.DEFAULT, null,
-						out effective_address);
-				}
+				yield listen_on (control_connectable, new ControlSourceTag ());
+				yield listen_on (cluster_connectable, new ClusterSourceTag ());
 			} catch (GLib.Error e) {
 				printerr ("Unable to start: %s\n", e.message);
 				exit_code = 3;
@@ -202,6 +188,15 @@ namespace Frida.Portal {
 				ready ();
 				return false;
 			});
+		}
+
+		private async void listen_on (SocketConnectable connectable, Object source) throws GLib.Error {
+			var enumerator = connectable.enumerate ();
+			SocketAddress? address;
+			while ((address = yield enumerator.next_async (io_cancellable)) != null) {
+				SocketAddress effective_address;
+				server.add_address (address, SocketType.STREAM, SocketProtocol.DEFAULT, source, out effective_address);
+			}
 		}
 
 		public void stop () {
@@ -218,25 +213,9 @@ namespace Frida.Portal {
 
 			server.stop ();
 
-			while (clients.size != 0) {
-				foreach (var entry in clients.entries) {
-					var connection = entry.key;
-					var client = entry.value;
-					clients.unset (connection);
-					try {
-						yield connection.flush ();
-					} catch (GLib.Error e) {
-					}
-					client.close ();
-					try {
-						yield connection.close ();
-					} catch (GLib.Error e) {
-					}
-					break;
-				}
-			}
-
-			agent_sessions.clear ();
+			foreach (var peer in peers.values.to_array ())
+				peer.close ();
+			peers.clear ();
 
 			io_cancellable.cancel ();
 
@@ -246,134 +225,12 @@ namespace Frida.Portal {
 			});
 		}
 
-		public async HostApplicationInfo get_frontmost_application (Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
-		}
-
-		public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws Error, IOError {
-			Gee.Collection<Node> nodes = node_by_identifier.values;
-			var result = new HostApplicationInfo[nodes.size];
-			int i = 0;
-			foreach (var node in nodes)
-				result[i++] = HostApplicationInfo (node.identifier, node.name, node.pid, node.small_icon, node.large_icon);
-			return result;
-		}
-
-		public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws Error, IOError {
-			Gee.Collection<Node> nodes = node_by_identifier.values;
-			var result = new HostProcessInfo[nodes.size];
-			int i = 0;
-			foreach (var node in nodes)
-				result[i++] = HostProcessInfo (node.pid, node.name, node.small_icon, node.large_icon);
-			return result;
-		}
-
-		public async void enable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
-			spawn_gating_enabled = true;
-		}
-
-		public async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
-			spawn_gating_enabled = false;
-
-			foreach (uint pid in pending_spawn.keys.to_array ())
-				do_resume (pid);
-		}
-
-		public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
-			var result = new HostSpawnInfo[pending_spawn.size];
-			var index = 0;
-			foreach (var spawn in pending_spawn.values)
-				result[index++] = spawn;
-			return result;
-		}
-
-		public async HostChildInfo[] enumerate_pending_children (Cancellable? cancellable) throws Error, IOError {
-			return {};
-		}
-
-		public async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
-		}
-
-		public async void input (uint pid, uint8[] data, Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
-		}
-
-		public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
-			do_resume (pid);
-		}
-
-		private void do_resume (uint pid) {
-			HostSpawnInfo? spawn;
-			if (!pending_spawn.unset (pid, out spawn))
-				return;
-			spawn_removed (spawn);
-
-			var node = node_by_pid[pid];
-			assert (node != null);
-
-			node.portal_session.resume ();
-		}
-
-		public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
-			var node = node_by_pid[pid];
-			if (node == null)
-				return;
-
-			node.portal_session.kill ();
-		}
-
-		public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {
-			try {
-				return yield attach_in_realm (pid, NATIVE, cancellable);
-			} catch (GLib.Error e) {
-				throw_dbus_error (e);
-			}
-		}
-
-		public async AgentSessionId attach_in_realm (uint pid, Realm realm, Cancellable? cancellable) throws Error, IOError {
-			Node node = get_node_by_pid (pid);
-
-			var id = AgentSessionId (next_agent_session_id++);
-			AgentSession session;
-
-			try {
-				yield node.provider.open (id, realm, cancellable);
-
-				session = yield node.connection.get_proxy (null, ObjectPath.from_agent_session_id (id), DBusProxyFlags.NONE,
-					cancellable);
-			} catch (GLib.Error e) {
-				throw new Error.PROTOCOL ("%s", e.message);
-			}
-
-			on_agent_session_opened (id, session);
-
-			return id;
-		}
-
-		public async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data,
-				Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
-		}
-
-		public async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data,
-				Cancellable? cancellable) throws Error, IOError {
-			throw new Error.NOT_SUPPORTED ("Not supported");
-		}
-
-		private Node get_node_by_pid (uint pid) throws Error {
-			var node = node_by_pid[pid];
-			if (node == null)
-				throw new Error.PROCESS_NOT_FOUND ("Unable to find process with pid %u", pid);
-			return node;
-		}
-
-		private bool on_server_connection (SocketConnection connection, Object? source_object) {
-			handle_server_connection.begin (connection);
+		private bool on_incoming_connection (SocketConnection connection, Object? source_object) {
+			on_connection_opened.begin (connection, source_object);
 			return true;
 		}
 
-		private async void handle_server_connection (SocketConnection socket_connection) throws GLib.Error {
+		private async void on_connection_opened (SocketConnection socket_connection, Object? source_object) throws GLib.Error {
 			var socket = socket_connection.socket;
 			if (socket.get_family () != UNIX)
 				Tcp.enable_nodelay (socket);
@@ -383,13 +240,25 @@ namespace Frida.Portal {
 				null, io_cancellable);
 			connection.on_closed.connect (on_connection_closed);
 
-			var client = new Client (this, connection);
-			client.register_host_session (this);
-			foreach (var e in agent_sessions.entries)
-				client.register_agent_session (e.key, e.value);
-			clients.set (connection, client);
+			Peer peer;
+			if (source_object is ControlSourceTag) {
+				var channel = new ControlChannel (this, connection);
+				peer = channel;
 
-			connection.start_message_processing ();
+				connection.start_message_processing ();
+			} else {
+				assert (source_object is ClusterSourceTag);
+
+				var node = new ClusterNode (this, connection);
+				node.session_closed.connect (on_agent_session_closed);
+				peer = node;
+
+				connection.start_message_processing ();
+
+				node.session_provider = yield connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER,
+					DBusProxyFlags.NONE, io_cancellable);
+			}
+			peers.set (connection, peer);
 		}
 
 		private void on_connection_closed (DBusConnection connection, bool remote_peer_vanished, GLib.Error? error) {
@@ -397,65 +266,128 @@ namespace Frida.Portal {
 			if (closed_by_us)
 				return;
 
-			Client client;
-			clients.unset (connection, out client);
+			Peer peer;
+			peers.unset (connection, out peer);
 
-			Node? node = client.node;
-			if (node != null) {
-				var dead_session_ids = new Gee.ArrayList<AgentSessionId?> (AgentSessionId.equal);
-				foreach (var e in agent_sessions.entries) {
-					DBusConnection candidate = ((DBusProxy) e.value).g_connection;
-					if (candidate == connection)
-						dead_session_ids.add (e.key);
+			ControlChannel? channel = peer as ControlChannel;
+			if (channel != null) {
+				foreach (var session in channel.sessions.values)
+					session.close.begin (io_cancellable);
+
+				disable_spawn_gating (channel);
+			} else {
+				assert (peer is ClusterNode);
+				ClusterNode node = (ClusterNode) peer;
+				ClusterMembership membership = node.membership;
+
+				foreach (var id in node.sessions) {
+					ControlChannel c;
+					if (sessions.unset (id, out c)) {
+						c.unregister_agent_session (id);
+						c.agent_session_destroyed (id, SessionDetachReason.PROCESS_TERMINATED);
+					}
 				}
-				foreach (AgentSessionId id in dead_session_ids) {
-					on_agent_session_closed (id, agent_sessions[id]);
-					agent_session_destroyed (id, SessionDetachReason.PROCESS_TERMINATED);
-				}
 
-				node_by_pid.unset (node.pid);
-				node_by_identifier.unset (node.identifier);
+				node_by_pid.unset (membership.pid);
+				node_by_identifier.unset (membership.identifier);
 
-				HostSpawnInfo? spawn;
-				if (pending_spawn.unset (node.pid, out spawn))
-					spawn_removed (spawn);
+				PendingSpawn spawn;
+				if (pending_spawn.unset (membership.pid, out spawn))
+					notify_spawn_removed (spawn.info);
 			}
 
-			client.close ();
-
-			if (client.is_spawn_gating)
-				disable_spawn_gating.begin (io_cancellable);
-
-			foreach (var pid in client.orphans)
-				kill.begin (pid, io_cancellable);
-
-			foreach (var session_id in client.sessions)
-				close_session.begin (session_id);
+			peer.close ();
 		}
 
-		private async void close_session (AgentSessionId id) {
-			var session = agent_sessions[id];
-			if (session == null)
-				return;
+		private HostApplicationInfo[] enumerate_applications () {
+			Gee.Collection<ClusterNode> nodes = node_by_identifier.values;
+			var result = new HostApplicationInfo[nodes.size];
+			int i = 0;
+			foreach (var node in nodes) {
+				ClusterMembership m = node.membership;
+				result[i++] = HostApplicationInfo (m.identifier, m.name, m.pid, m.small_icon, m.large_icon);
+			}
+			return result;
+		}
 
-			try {
-				yield session.close (io_cancellable);
-			} catch (GLib.Error e) {
+		private HostProcessInfo[] enumerate_processes () {
+			Gee.Collection<ClusterNode> nodes = node_by_identifier.values;
+			var result = new HostProcessInfo[nodes.size];
+			int i = 0;
+			foreach (var node in nodes) {
+				ClusterMembership m = node.membership;
+				result[i++] = HostProcessInfo (m.pid, m.name, m.small_icon, m.large_icon);
+			}
+			return result;
+		}
+
+		private void enable_spawn_gating (ControlChannel requester) {
+			spawn_gaters.add (requester);
+			foreach (var spawn in pending_spawn.values)
+				spawn.pending_approvers.add (requester);
+		}
+
+		private void disable_spawn_gating (ControlChannel requester) {
+			if (spawn_gaters.remove (requester)) {
+				foreach (uint pid in pending_spawn.keys.to_array ())
+					resume (pid, requester);
 			}
 		}
 
-		private async void add_node (Client client, HostApplicationInfo app, Cancellable? cancellable,
-				out SpawnStartState start_state) {
-			start_state = RUNNING;
+		private HostSpawnInfo[] enumerate_pending_spawn () {
+			var result = new HostSpawnInfo[pending_spawn.size];
+			var i = 0;
+			foreach (var spawn in pending_spawn.values)
+				result[i++] = spawn.info;
+			return result;
+		}
 
-			AgentSessionProvider provider;
-			try {
-				provider = yield client.connection.get_proxy (null, ObjectPath.AGENT_SESSION_PROVIDER, DBusProxyFlags.NONE,
-					io_cancellable);
-			} catch (IOError e) {
+		private void resume (uint pid, ControlChannel requester) {
+			PendingSpawn spawn = pending_spawn[pid];
+			if (spawn == null)
 				return;
+
+			var approvers = spawn.pending_approvers;
+			approvers.remove (requester);
+			if (approvers.is_empty) {
+				pending_spawn.unset (pid);
+
+				var node = node_by_pid[pid];
+				assert (node != null);
+				node.resume ();
+
+				notify_spawn_removed (spawn.info);
 			}
-			provider.closed.connect (on_agent_session_provider_closed);
+		}
+
+		private void kill (uint pid) {
+			var node = node_by_pid[pid];
+			if (node == null)
+				return;
+
+			node.kill ();
+		}
+
+		private async AgentSession attach (uint pid, Realm realm, ControlChannel requester, Cancellable? cancellable,
+				out AgentSessionId id) throws Error, IOError {
+			var node = node_by_pid[pid];
+			if (node == null)
+				throw new Error.PROCESS_NOT_FOUND ("Unable to find process with pid %u", pid);
+
+			id = AgentSessionId (next_agent_session_id++);
+
+			var session = yield node.open_session (id, realm, cancellable);
+			sessions[id] = requester;
+
+			return session;
+		}
+
+		private async void handle_join_request (ClusterNode node, HostApplicationInfo app, Cancellable? cancellable,
+				out SpawnStartState start_state) throws Error {
+			if (node.membership != null)
+				throw new Error.PROTOCOL ("Node has already joined");
+			if (node.session_provider == null)
+				throw new Error.PROTOCOL ("Missing session provider");
 
 			uint pid = app.pid;
 			while (node_by_pid.has_key (pid))
@@ -468,55 +400,51 @@ namespace Frida.Portal {
 				candidate = "%s[%u]".printf (real_identifier, serial++);
 			string identifier = candidate;
 
-			var node = new Node (pid, identifier, app.name, app.small_icon, app.large_icon, client.connection, client,
-				provider);
+			node.membership = new ClusterMembership (pid, identifier, app.name, app.small_icon, app.large_icon);
+
 			node_by_pid[pid] = node;
 			node_by_identifier[identifier] = node;
 
-			client.node = node;
-
-			if (spawn_gating_enabled) {
-				var spawn = HostSpawnInfo (pid, identifier);
-				pending_spawn[pid] = spawn;
-				spawn_added (spawn);
-
-				start_state = SUSPENDED;
-			} else {
+			if (spawn_gaters.is_empty) {
 				start_state = RUNNING;
+			} else {
+				start_state = SUSPENDED;
+
+				var spawn = new PendingSpawn (pid, identifier, spawn_gaters.iterator ());
+				pending_spawn[pid] = spawn;
+				notify_spawn_added (spawn.info);
 			}
 		}
 
-		private void on_agent_session_provider_closed (AgentSessionId id) {
-			AgentSession session;
-			var closed_after_opening = agent_sessions.unset (id, out session);
-			if (!closed_after_opening)
-				return;
-			var reason = SessionDetachReason.APPLICATION_REQUESTED;
-			on_agent_session_closed (id, session);
-			agent_session_destroyed (id, reason);
+		private void notify_spawn_added (HostSpawnInfo info) {
+			foreach (ControlChannel channel in spawn_gaters)
+				channel.spawn_added (info);
 		}
 
-		private void on_agent_session_opened (AgentSessionId id, AgentSession session) {
-			agent_sessions[id] = session;
+		private void notify_spawn_removed (HostSpawnInfo info) {
+			foreach (ControlChannel channel in spawn_gaters)
+				channel.spawn_removed (info);
+		}
 
-			DBusConnection connection = ((DBusProxy) session).g_connection;
-			foreach (var e in clients.entries) {
-				if (e.key != connection)
-					e.value.register_agent_session (id, session);
+		private void on_agent_session_closed (AgentSessionId id) {
+			ControlChannel channel;
+			if (sessions.unset (id, out channel)) {
+				channel.unregister_agent_session (id);
+				channel.agent_session_destroyed (id, SessionDetachReason.APPLICATION_REQUESTED);
 			}
 		}
 
-		private void on_agent_session_closed (AgentSessionId id, AgentSession session) {
-			DBusConnection connection = ((DBusProxy) session).g_connection;
-			foreach (var e in clients.entries) {
-				if (e.key != connection)
-					e.value.unregister_agent_session (id, session);
-			}
-
-			agent_sessions.unset (id);
+		private class ControlSourceTag : Object {
 		}
 
-		private class Client : Object, PortalSession {
+		private class ClusterSourceTag : Object {
+		}
+
+		private interface Peer : Object {
+			public abstract void close ();
+		}
+
+		private class ControlChannel : Object, Peer, HostSession {
 			public weak Application parent {
 				get;
 				construct;
@@ -527,42 +455,23 @@ namespace Frida.Portal {
 				construct;
 			}
 
-			public bool is_spawn_gating {
+			public Gee.Map<AgentSessionId?, AgentSession> sessions {
 				get;
-				private set;
+				default = new Gee.HashMap<AgentSessionId?, AgentSession> (AgentSessionId.hash, AgentSessionId.equal);
 			}
 
-			public Gee.HashSet<uint> orphans {
-				get;
-				default = new Gee.HashSet<uint> ();
-			}
-
-			public Gee.HashSet<AgentSessionId?> sessions {
-				get;
-				default = new Gee.HashSet<AgentSessionId?> (AgentSessionId.hash, AgentSessionId.equal);
-			}
-
-			public Node? node {
-				get;
-				set;
-			}
-
-			private uint filter_id;
-			private Gee.HashSet<uint> registrations = new Gee.HashSet<uint> ();
-			private Gee.HashMap<AgentSessionId?, uint> agent_registrations =
+			private Gee.Set<uint> registrations = new Gee.HashSet<uint> ();
+			private Gee.Map<AgentSessionId?, uint> agent_registrations =
 				new Gee.HashMap<AgentSessionId?, uint> (AgentSessionId.hash, AgentSessionId.equal);
-			private Gee.HashMap<uint32, DBusMessage> method_calls = new Gee.HashMap<uint32, DBusMessage> ();
 
-			public Client (Application parent, DBusConnection connection) {
+			public ControlChannel (Application parent, DBusConnection connection) {
 				Object (parent: parent, connection: connection);
 			}
 
 			construct {
-				filter_id = connection.add_filter (on_connection_message);
-
 				try {
-					PortalSession session = this;
-					registrations.add (connection.register_object (ObjectPath.PORTAL_SESSION, session));
+					HostSession session = this;
+					registrations.add (connection.register_object (ObjectPath.HOST_SESSION, session));
 				} catch (IOError e) {
 					assert_not_reached ();
 				}
@@ -574,139 +483,189 @@ namespace Frida.Portal {
 				foreach (var registration_id in registrations)
 					connection.unregister_object (registration_id);
 				registrations.clear ();
-
-				connection.remove_filter (filter_id);
 			}
 
-			public void register_host_session (HostSession session) {
+			public async HostApplicationInfo get_frontmost_application (Cancellable? cancellable) throws Error, IOError {
+				throw new Error.NOT_SUPPORTED ("Not supported");
+			}
+
+			public async HostApplicationInfo[] enumerate_applications (Cancellable? cancellable) throws Error, IOError {
+				return parent.enumerate_applications ();
+			}
+
+			public async HostProcessInfo[] enumerate_processes (Cancellable? cancellable) throws Error, IOError {
+				return parent.enumerate_processes ();
+			}
+
+			public async void enable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
+				parent.enable_spawn_gating (this);
+			}
+
+			public async void disable_spawn_gating (Cancellable? cancellable) throws Error, IOError {
+				parent.disable_spawn_gating (this);
+			}
+
+			public async HostSpawnInfo[] enumerate_pending_spawn (Cancellable? cancellable) throws Error, IOError {
+				return parent.enumerate_pending_spawn ();
+			}
+
+			public async HostChildInfo[] enumerate_pending_children (Cancellable? cancellable) throws Error, IOError {
+				return {};
+			}
+
+			public async uint spawn (string program, HostSpawnOptions options, Cancellable? cancellable) throws Error, IOError {
+				throw new Error.NOT_SUPPORTED ("Not supported");
+			}
+
+			public async void input (uint pid, uint8[] data, Cancellable? cancellable) throws Error, IOError {
+				throw new Error.NOT_SUPPORTED ("Not supported");
+			}
+
+			public async void resume (uint pid, Cancellable? cancellable) throws Error, IOError {
+				parent.resume (pid, this);
+			}
+
+			public async void kill (uint pid, Cancellable? cancellable) throws Error, IOError {
+				parent.kill (pid);
+			}
+
+			public async AgentSessionId attach_to (uint pid, Cancellable? cancellable) throws Error, IOError {
 				try {
-					registrations.add (connection.register_object (ObjectPath.HOST_SESSION, session));
-				} catch (IOError e) {
-					assert_not_reached ();
+					return yield attach_in_realm (pid, NATIVE, cancellable);
+				} catch (GLib.Error e) {
+					throw_dbus_error (e);
 				}
 			}
 
-			public void register_agent_session (AgentSessionId id, AgentSession session) {
-				var proxy = (DBusProxy) session;
-				if (proxy.g_connection == connection)
-					return;
+			public async AgentSessionId attach_in_realm (uint pid, Realm realm, Cancellable? cancellable) throws Error, IOError {
+				AgentSessionId id;
+				var session = yield parent.attach (pid, realm, this, cancellable, out id);
 
+				register_agent_session (id, session);
+
+				return id;
+			}
+
+			public async InjectorPayloadId inject_library_file (uint pid, string path, string entrypoint, string data,
+					Cancellable? cancellable) throws Error, IOError {
+				throw new Error.NOT_SUPPORTED ("Not supported");
+			}
+
+			public async InjectorPayloadId inject_library_blob (uint pid, uint8[] blob, string entrypoint, string data,
+					Cancellable? cancellable) throws Error, IOError {
+				throw new Error.NOT_SUPPORTED ("Not supported");
+			}
+
+			private void register_agent_session (AgentSessionId id, AgentSession session) {
 				try {
+					sessions[id] = session;
+
 					var registration_id = connection.register_object (ObjectPath.from_agent_session_id (id), session);
 					registrations.add (registration_id);
+
 					agent_registrations.set (id, registration_id);
 				} catch (IOError e) {
 					assert_not_reached ();
 				}
 			}
 
-			public void unregister_agent_session (AgentSessionId id, AgentSession session) {
-				var proxy = (DBusProxy) session;
-				if (proxy.g_connection == connection)
-					return;
-
+			public void unregister_agent_session (AgentSessionId id) {
 				uint registration_id;
 				agent_registrations.unset (id, out registration_id);
+
 				registrations.remove (registration_id);
 				connection.unregister_object (registration_id);
+
+				sessions.unset (id);
+			}
+		}
+
+		private class ClusterNode : Object, Peer, PortalSession {
+			public signal void session_closed (AgentSessionId id);
+
+			public weak Application parent {
+				get;
+				construct;
+			}
+
+			public ClusterMembership? membership {
+				get;
+				set;
+			}
+
+			public DBusConnection connection {
+				get;
+				construct;
+			}
+
+			public AgentSessionProvider? session_provider {
+				get {
+					return _session_provider;
+				}
+				set {
+					if (_session_provider != null)
+						_session_provider.closed.disconnect (on_session_closed);
+					_session_provider = value;
+					_session_provider.closed.connect (on_session_closed);
+				}
+			}
+			private AgentSessionProvider? _session_provider;
+
+			public Gee.Set<AgentSessionId?> sessions {
+				get;
+				default = new Gee.HashSet<AgentSessionId?> (AgentSessionId.hash, AgentSessionId.equal);
+			}
+
+			private Gee.Set<uint> registrations = new Gee.HashSet<uint> ();
+
+			public ClusterNode (Application parent, DBusConnection connection) {
+				Object (parent: parent, connection: connection);
+			}
+
+			construct {
+				try {
+					PortalSession session = this;
+					registrations.add (connection.register_object (ObjectPath.PORTAL_SESSION, session));
+				} catch (IOError e) {
+					assert_not_reached ();
+				}
+			}
+
+			public void close () {
+				foreach (var registration_id in registrations)
+					connection.unregister_object (registration_id);
+				registrations.clear ();
 			}
 
 			public async void join (HostApplicationInfo app, Cancellable? cancellable,
 					out SpawnStartState start_state) throws Error {
-				yield parent.add_node (this, app, cancellable, out start_state);
+				yield parent.handle_join_request (this, app, cancellable, out start_state);
 			}
 
-			private void schedule_idle (owned ScheduledFunc func) {
-				var client = this;
-				Idle.add (() => {
-					func ();
-					client = null;
-					return false;
-				});
+			public async AgentSession open_session (AgentSessionId id, Realm realm,
+					Cancellable? cancellable) throws Error, IOError {
+				AgentSession session;
+				try {
+					yield session_provider.open (id, realm, cancellable);
+
+					session = yield connection.get_proxy (null, ObjectPath.from_agent_session_id (id),
+						DBusProxyFlags.NONE, cancellable);
+				} catch (GLib.Error e) {
+					throw new Error.PROTOCOL ("%s", e.message);
+				}
+
+				sessions.add (id);
+
+				return session;
 			}
 
-			private delegate void ScheduledFunc ();
-
-			private GLib.DBusMessage on_connection_message (DBusConnection connection, owned DBusMessage message,
-					bool incoming) {
-				DBusMessage result = message;
-
-				var type = message.get_message_type ();
-				DBusMessage call = null;
-				switch (type) {
-					case DBusMessageType.METHOD_CALL:
-						method_calls[message.get_serial ()] = message;
-						break;
-					case DBusMessageType.METHOD_RETURN:
-						method_calls.unset (message.get_reply_serial (), out call);
-						break;
-					case DBusMessageType.ERROR:
-						method_calls.unset (message.get_reply_serial (), out call);
-						break;
-					case DBusMessageType.SIGNAL:
-						break;
-					default:
-						assert_not_reached ();
-				}
-
-				if (type == DBusMessageType.SIGNAL || type == DBusMessageType.ERROR)
-					return result;
-
-				string path, iface, member;
-				if (call == null) {
-					path = message.get_path ();
-					iface = message.get_interface ();
-					member = message.get_member ();
-				} else {
-					path = call.get_path ();
-					iface = call.get_interface ();
-					member = call.get_member ();
-				}
-				if (iface == "re.frida.HostSession14") {
-					if (member == "EnableSpawnGating" && type == DBusMessageType.METHOD_RETURN) {
-						schedule_idle (() => {
-							is_spawn_gating = true;
-						});
-					} else if (member == "DisableSpawnGating" && type == DBusMessageType.METHOD_RETURN) {
-						schedule_idle (() => {
-							is_spawn_gating = false;
-						});
-					} else if (member == "Spawn" && type == DBusMessageType.METHOD_RETURN) {
-						uint32 pid;
-						message.get_body ().get ("(u)", out pid);
-						schedule_idle (() => {
-							orphans.add (pid);
-						});
-					} else if ((member == "Resume" || member == "Kill") && type == DBusMessageType.METHOD_RETURN) {
-						uint32 pid;
-						call.get_body ().get ("(u)", out pid);
-						schedule_idle (() => {
-							orphans.remove (pid);
-						});
-					} else if (member == "AttachTo" && type == DBusMessageType.METHOD_RETURN) {
-						uint32 raw_id;
-						message.get_body ().get ("((u))", out raw_id);
-						schedule_idle (() => {
-							sessions.add (AgentSessionId (raw_id));
-						});
-					}
-				} else if (iface == "re.frida.AgentSession14") {
-					uint raw_id;
-					path.scanf ("/re/frida/AgentSession/%u", out raw_id);
-					if (member == "Close") {
-						if (type != DBusMessageType.METHOD_CALL) {
-							schedule_idle (() => {
-								sessions.remove (AgentSessionId (raw_id));
-							});
-						}
-					}
-				}
-
-				return result;
+			private void on_session_closed (AgentSessionId id) {
+				if (sessions.remove (id))
+					session_closed (id);
 			}
 		}
 
-		private class Node : Object {
+		private class ClusterMembership : Object {
 			public uint pid {
 				get;
 				construct;
@@ -747,19 +706,52 @@ namespace Frida.Portal {
 				construct;
 			}
 
-			public Node (uint pid, string identifier, string name, ImageData small_icon, ImageData large_icon,
-					DBusConnection connection, PortalSession portal_session, AgentSessionProvider provider) {
+			public ClusterMembership (uint pid, string identifier, string name, ImageData small_icon, ImageData large_icon) {
 				Object (
 					pid: pid,
 					identifier: identifier,
 					name: name,
 					small_icon: small_icon,
-					large_icon: large_icon,
-					connection: connection,
-					portal_session: portal_session,
-					provider: provider
+					large_icon: large_icon
 				);
 			}
+		}
+
+		private class PendingSpawn {
+			public HostSpawnInfo info {
+				get;
+				private set;
+			}
+
+			public Gee.Set<ControlChannel> pending_approvers {
+				get;
+				default = new Gee.HashSet<ControlChannel> ();
+			}
+
+			public PendingSpawn (uint pid, string identifier, Gee.Iterator<ControlChannel> gaters) {
+				info = HostSpawnInfo (pid, identifier);
+				pending_approvers.add_all_iterator (gaters);
+			}
+		}
+	}
+
+	private static SocketConnectable parse_socket_address (string? configured_address, string default_address,
+			uint16 default_port) throws GLib.Error {
+		string address = (configured_address != null) ? configured_address : default_address;
+#if !WINDOWS
+		if (address.has_prefix ("unix:")) {
+			string path = address.substring (5);
+
+			UnixSocketAddressType type = UnixSocketAddress.abstract_names_supported ()
+				? UnixSocketAddressType.ABSTRACT
+				: UnixSocketAddressType.PATH;
+
+			return new UnixSocketAddress.with_type (path, -1, type);
+		} else {
+#else
+		{
+#endif
+			return NetworkAddress.parse (address, default_port);
 		}
 	}
 }
